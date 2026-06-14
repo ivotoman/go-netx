@@ -253,3 +253,164 @@ func TestMuxClient_DialError(t *testing.T) {
 		t.Fatalf("expected dial error, got %v", err)
 	}
 }
+
+// --- Self-heal mode (WithMuxClientSelfHeal) -------------------------------------
+
+// fakeConn is a programmable net.Conn for the self-heal tests. readFn drives the
+// Read behaviour (data, errors, timeouts); writes succeed by default.
+type fakeConn struct {
+	readFn  func(b []byte) (int, error)
+	writeFn func(b []byte) (int, error)
+	mu      sync.Mutex
+	closed  bool
+}
+
+func (f *fakeConn) Read(b []byte) (int, error) { return f.readFn(b) }
+func (f *fakeConn) Write(b []byte) (int, error) {
+	if f.writeFn != nil {
+		return f.writeFn(b)
+	}
+	return len(b), nil
+}
+func (f *fakeConn) Close() error {
+	f.mu.Lock()
+	f.closed = true
+	f.mu.Unlock()
+	return nil
+}
+func (f *fakeConn) isClosed() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.closed
+}
+func (f *fakeConn) LocalAddr() net.Addr              { return &net.TCPAddr{} }
+func (f *fakeConn) RemoteAddr() net.Addr             { return &net.TCPAddr{} }
+func (f *fakeConn) SetDeadline(time.Time) error      { return nil }
+func (f *fakeConn) SetReadDeadline(time.Time) error  { return nil }
+func (f *fakeConn) SetWriteDeadline(time.Time) error { return nil }
+
+// readOnce returns data on the first call, then io.EOF.
+func readOnce(data []byte) func(b []byte) (int, error) {
+	done := false
+	return func(b []byte) (int, error) {
+		if done {
+			return 0, io.EOF
+		}
+		done = true
+		return copy(b, data), nil
+	}
+}
+
+type timeoutErr struct{}
+
+func (timeoutErr) Error() string   { return "i/o timeout" }
+func (timeoutErr) Timeout() bool   { return true }
+func (timeoutErr) Temporary() bool { return true }
+
+// seqDialer hands out the given conns in order, then errors.
+func seqDialer(conns ...net.Conn) netx.Dialer {
+	i := 0
+	return func() (net.Conn, error) {
+		if i >= len(conns) {
+			return nil, errors.New("no more conns")
+		}
+		c := conns[i]
+		i++
+		return c, nil
+	}
+}
+
+// In self-heal mode a non-EOF read error (here a connection reset) must re-dial
+// — exactly the network-change case the default EOF-only path leaves stuck.
+func TestMuxClient_SelfHeal_RedialsOnNonEOFError(t *testing.T) {
+	dead := &fakeConn{readFn: func([]byte) (int, error) { return 0, errors.New("connection reset by peer") }}
+	healed := &fakeConn{readFn: readOnce([]byte("healed"))}
+	dc := netx.NewMuxClient(seqDialer(dead, healed), netx.WithMuxClientSelfHeal(0))
+	defer dc.Close()
+
+	buf := make([]byte, 256)
+	n, err := dc.Read(buf)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(buf[:n]) != "healed" {
+		t.Fatalf("got %q, want %q", buf[:n], "healed")
+	}
+	if !dead.isClosed() {
+		t.Fatal("expected the dead conn to be closed on re-dial")
+	}
+}
+
+// A read-deadline timeout is a net.Error/Timeout — in DEFAULT mode it propagates
+// (see TestMuxClient_Deadlines); in self-heal mode it must re-dial instead.
+func TestMuxClient_SelfHeal_RedialsOnTimeout(t *testing.T) {
+	stalled := &fakeConn{readFn: func([]byte) (int, error) { return 0, timeoutErr{} }}
+	healed := &fakeConn{readFn: readOnce([]byte("after-timeout"))}
+	dc := netx.NewMuxClient(seqDialer(stalled, healed), netx.WithMuxClientSelfHeal(10*time.Millisecond))
+	defer dc.Close()
+
+	buf := make([]byte, 256)
+	n, err := dc.Read(buf)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(buf[:n]) != "after-timeout" {
+		t.Fatalf("got %q, want %q", buf[:n], "after-timeout")
+	}
+}
+
+// WithMuxClientConn seeds the current conn so the first Read uses it without
+// dialling (the dialer must not be called).
+func TestMuxClient_SelfHeal_SeedsInitialConn(t *testing.T) {
+	seed := &fakeConn{readFn: readOnce([]byte("seeded"))}
+	dc := netx.NewMuxClient(
+		func() (net.Conn, error) { t.Fatal("dialer must not be called"); return nil, nil },
+		netx.WithMuxClientConn(seed),
+		netx.WithMuxClientSelfHeal(0),
+	)
+	defer dc.Close()
+
+	buf := make([]byte, 256)
+	n, err := dc.Read(buf)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(buf[:n]) != "seeded" {
+		t.Fatalf("got %q, want %q", buf[:n], "seeded")
+	}
+}
+
+// A dial failure (no current conn) must propagate, not loop forever.
+func TestMuxClient_SelfHeal_DialErrorPropagates(t *testing.T) {
+	dialErr := errors.New("dial failed")
+	dc := netx.NewMuxClient(func() (net.Conn, error) { return nil, dialErr }, netx.WithMuxClientSelfHeal(0))
+	defer dc.Close()
+
+	done := make(chan struct{})
+	go func() {
+		_, err := dc.Read(make([]byte, 256))
+		if !errors.Is(err, dialErr) {
+			t.Errorf("expected dial error, got %v", err)
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("self-heal Read looped on dial error instead of propagating")
+	}
+}
+
+// Close must break the self-heal loop.
+func TestMuxClient_SelfHeal_ClosedReturns(t *testing.T) {
+	dc := netx.NewMuxClient(seqDialer(), netx.WithMuxClientSelfHeal(0))
+	if err := dc.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if _, err := dc.Read(make([]byte, 256)); err == nil {
+		t.Fatal("expected error reading after close")
+	}
+	if _, err := dc.Write([]byte("x")); err == nil {
+		t.Fatal("expected error writing after close")
+	}
+}

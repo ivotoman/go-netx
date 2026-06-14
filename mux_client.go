@@ -41,6 +41,13 @@ type muxClient struct {
 	deadlineMu    sync.Mutex
 	readDeadline  time.Time
 	writeDeadline time.Time
+
+	// Self-heal mode (opt-in; see WithMuxClientSelfHeal). OFF by default so the
+	// default MuxClient — used by the `mux` wrapper — keeps its EOF-only redial +
+	// error-propagation contract (a read-deadline timeout PROPAGATES, it does not
+	// redial; see TestMuxClient_Deadlines).
+	selfHeal    bool
+	readTimeout time.Duration
 }
 
 type MuxClientOption func(*muxClient)
@@ -49,6 +56,38 @@ type MuxClientOption func(*muxClient)
 func WithMuxClientLogger(logger Logger) MuxClientOption {
 	return func(c *muxClient) {
 		c.logger = logger
+	}
+}
+
+// WithMuxClientConn seeds the MuxClient with an already-dialled connection as its
+// current one, so the first Read/Write uses it instead of dialling again. Lets a
+// caller dial eagerly (to validate the upstream / fast-fail) and still hand the
+// live connection to a self-healing MuxClient without paying a second handshake.
+func WithMuxClientConn(initial net.Conn) MuxClientOption {
+	return func(c *muxClient) {
+		c.current = initial
+	}
+}
+
+// WithMuxClientSelfHeal makes the MuxClient transparently re-dial on ANY read or
+// write error (not just io.EOF) and, when readTimeout > 0, set that deadline on
+// each read. This detects and recovers a silently half-open connection — e.g. a
+// UDP association whose bound physical interface vanished on a network change,
+// where reads block forever and writes succeed into the void, with no error to
+// trip the EOF-only path. A re-dial re-runs the dial function from scratch, which
+// for the obfuscation tunnel peer (cli/internal/tun.go) re-runs dialControl and
+// re-binds the socket to the CURRENT physical interface — restoring rx without an
+// external stop→start.
+//
+// OFF by default: only the tunnel peer dial opts in. A dial error still
+// propagates (it is not retried in a tight loop); the readTimeout paces the
+// re-dial loop so it can never busy-spin. Pick readTimeout comfortably above the
+// tunnel's keepalive cadence so a merely-idle (healthy) link is not re-dialled
+// needlessly — the re-dial is transparent but not free.
+func WithMuxClientSelfHeal(readTimeout time.Duration) MuxClientOption {
+	return func(c *muxClient) {
+		c.selfHeal = true
+		c.readTimeout = readTimeout
 	}
 }
 
@@ -123,6 +162,10 @@ func (c *muxClient) Read(b []byte) (int, error) {
 	c.rMu.Lock()
 	defer c.rMu.Unlock()
 
+	if c.selfHeal {
+		return c.readSelfHeal(b)
+	}
+
 	for {
 		if c.closed.Load() {
 			return 0, net.ErrClosed
@@ -154,9 +197,61 @@ func (c *muxClient) Read(b []byte) (int, error) {
 	}
 }
 
+// readSelfHeal is Read for self-heal mode (see WithMuxClientSelfHeal): re-dial on
+// ANY read error, not just io.EOF, so a half-open connection after a network
+// change is recovered. A dial error propagates (no tight retry loop); the
+// per-read deadline paces the re-dial loop so it never busy-spins.
+func (c *muxClient) readSelfHeal(b []byte) (int, error) {
+	for {
+		if c.closed.Load() {
+			return 0, net.ErrClosed
+		}
+
+		conn, err := c.ensureConn()
+		if err != nil {
+			if c.closed.Load() {
+				return 0, net.ErrClosed
+			}
+			// Dial (incl. handshake) failed — e.g. the network is genuinely
+			// down. Propagate so the relay tears the route down rather than
+			// re-handshaking in a loop; the next inbound packet re-establishes it.
+			return 0, err
+		}
+
+		if c.readTimeout > 0 {
+			_ = conn.SetReadDeadline(time.Now().Add(c.readTimeout))
+		}
+
+		n, err := conn.Read(b)
+		if n > 0 {
+			if errors.Is(err, io.EOF) {
+				c.replaceCurrent(conn)
+			}
+			return n, nil
+		}
+		if err != nil {
+			if c.closed.Load() {
+				return 0, net.ErrClosed
+			}
+			// EOF, a read-deadline timeout, ECONNRESET, ENETUNREACH, … all mean
+			// the inbound path is dead: drop this conn and re-dial (a fresh dial
+			// re-binds to the current physical interface). Re-dialling here, not
+			// returning, is what makes the tunnel self-heal a network change.
+			c.logger.InfoContext(context.Background(), "muxClient: re-dialing peer after read error", "error", err)
+			c.replaceCurrent(conn)
+			continue
+		}
+		// n == 0 with no error: benign short read — read again on the same conn.
+	}
+}
+
 func (c *muxClient) Write(b []byte) (int, error) {
 	c.wMu.Lock()
 	defer c.wMu.Unlock()
+
+	if c.selfHeal {
+		return c.writeSelfHeal(b)
+	}
 
 	if c.closed.Load() {
 		return 0, net.ErrClosed
@@ -171,6 +266,34 @@ func (c *muxClient) Write(b []byte) (int, error) {
 	}
 
 	return conn.Write(b)
+}
+
+// writeSelfHeal is Write for self-heal mode: on a write error, drop the conn and
+// re-dial once, then retry. Bounded (max two attempts) so a hard failure
+// propagates instead of looping. Most network-change failures surface on the
+// read path (a half-open socket still accepts writes), so this is the secondary
+// recovery trigger.
+func (c *muxClient) writeSelfHeal(b []byte) (int, error) {
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		if c.closed.Load() {
+			return 0, net.ErrClosed
+		}
+		conn, err := c.ensureConn()
+		if err != nil {
+			if c.closed.Load() {
+				return 0, net.ErrClosed
+			}
+			return 0, err
+		}
+		n, err := conn.Write(b)
+		if err == nil {
+			return n, nil
+		}
+		lastErr = err
+		c.replaceCurrent(conn)
+	}
+	return 0, lastErr
 }
 
 func (c *muxClient) Close() error {
