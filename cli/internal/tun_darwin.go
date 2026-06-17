@@ -45,20 +45,28 @@ func dialControl(network, address string, c syscall.RawConn) error {
 	return nil
 }
 
-// primaryPhysicalIfaceIndex returns the index of the lowest-index, up,
-// non-loopback, NON-TUNNEL interface that carries a usable (non-link-local) IPv4
-// address — the device's active physical uplink. Used on iOS only (see
-// dialControl). It must include cellular (pdp_ipN), not just Wi-Fi (enN): a
-// Wi-Fi->cellular switch leaves only pdp_ip0 up, and an en-only match would find
-// nothing -> the dial proceeds unbound -> netx loops into the tunnel (rx=0).
-// Tunnel interfaces (utun/ipsec/ppp/tap) are excluded so we never bind to our own
-// tunnel (whose utun carries a usable 10.x address).
+// primaryPhysicalIfaceIndex returns the index of the device's active physical
+// uplink — an up, non-loopback, NON-TUNNEL interface carrying a usable
+// (non-link-local) IPv4 address. Used on iOS only (see dialControl).
+//
+// PREFERENCE, not lowest-index: when BOTH Wi-Fi (enN) and cellular (pdp_ipN) are
+// up — the normal case on a cellular iPhone/iPad — iOS routes general traffic over
+// Wi-Fi (the default route), so netx must bind Wi-Fi. The old "lowest ifindex"
+// pick bound whichever index was smaller, which on real devices is often cellular
+// (e.g. pdp_ip0=3 < en0=22): netx then egressed cellular, its DTLS handshake to
+// the relay timed out, and the tunnel was dead-on-arrival ("handshake error:
+// context deadline exceeded", rx=0) even though Wi-Fi worked fine. So: prefer the
+// lowest-index Wi-Fi/wired (enN) interface; fall back to cellular/other ONLY when
+// no enN uplink is up (a Wi-Fi->cellular switch leaves only pdp_ip0 — still bind
+// it rather than dial unbound and loop into the tunnel). Tunnel interfaces
+// (utun/ipsec/ppp/tap) are excluded so we never bind our own tunnel.
 func primaryPhysicalIfaceIndex() (int, bool) {
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return 0, false
 	}
-	best := -1
+	bestEn := -1    // Wi-Fi / wired (enN) — iOS default uplink when present
+	bestOther := -1 // cellular (pdp_ipN) or other physical — fallback only
 	for _, ifi := range ifaces {
 		if ifi.Flags&net.FlagUp == 0 || ifi.Flags&net.FlagLoopback != 0 {
 			continue
@@ -92,12 +100,19 @@ func primaryPhysicalIfaceIndex() (int, bool) {
 		if !hasV4 {
 			continue
 		}
-		if best == -1 || ifi.Index < best {
-			best = ifi.Index
+		if strings.HasPrefix(n, "en") {
+			if bestEn == -1 || ifi.Index < bestEn {
+				bestEn = ifi.Index
+			}
+		} else if bestOther == -1 || ifi.Index < bestOther {
+			bestOther = ifi.Index
 		}
 	}
-	if best == -1 {
-		return 0, false
+	if bestEn != -1 {
+		return bestEn, true
 	}
-	return best, true
+	if bestOther != -1 {
+		return bestOther, true
+	}
+	return 0, false
 }
