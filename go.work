@@ -6,7 +6,13 @@ use (
 	./proto/aesgcm
 	./proto/dnst
 	./proto/ssh
+	./proto/socksaddr
+	./proto/prepend
+	./proto/trojan
+	./proto/ss2022
 	./drivers/aesgcm
+	./drivers/trojan
+	./drivers/ss2022
 	./drivers/dnst
 	./drivers/dtls
 	./drivers/dtlspsk

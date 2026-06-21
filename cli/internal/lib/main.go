@@ -22,9 +22,11 @@ import (
 	_ "github.com/pedramktb/go-netx/drivers/dnst"
 	_ "github.com/pedramktb/go-netx/drivers/dtls"
 	_ "github.com/pedramktb/go-netx/drivers/dtlspsk"
+	_ "github.com/pedramktb/go-netx/drivers/ss2022"
 	_ "github.com/pedramktb/go-netx/drivers/ssh"
 	_ "github.com/pedramktb/go-netx/drivers/tls"
 	_ "github.com/pedramktb/go-netx/drivers/tlspsk"
+	_ "github.com/pedramktb/go-netx/drivers/trojan"
 	_ "github.com/pedramktb/go-netx/drivers/utls"
 )
 
