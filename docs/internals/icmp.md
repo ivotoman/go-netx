@@ -1,13 +1,13 @@
 # ICMP Transport
 
-> Internals doc. Goal: let future edits avoid unintended consequences. Every
-> claim is grounded in code as `file:line`. Where the code is ambiguous or a
-> claim could not be fully verified from source, it is explicitly flagged
-> **(AMBIGUITY)**.
+> Internals / change-safety doc. Cites code by **symbol + file**, not line numbers
+> (line numbers rot on every refactor). Bare line numbers appear only for things
+> with no stable symbol (a specific error literal, a numeric default in a struct
+> literal), and even then the enclosing function/struct is named.
 
-Module path: `github.com/pedramktb/go-netx` (`go.mod:1`).
+Module: `github.com/pedramktb/go-netx` (root).
 Files in scope: `icmp_conn.go`, `icmp_listener.go`, `ip.go`, `packet.go`,
-`dial.go`, plus the transport registration in `transport.go`.
+`dial.go` (the `Dial`/`Listen` branches), `transport.go` (`TransportICMP`).
 
 ---
 
@@ -15,583 +15,460 @@ Files in scope: `icmp_conn.go`, `icmp_listener.go`, `ip.go`, `packet.go`,
 
 `icmp` is a **base transport** (peer of `tcp`/`udp`) that tunnels an arbitrary
 byte stream over ICMP **Echo Request / Echo Reply** packets, so traffic can
-traverse firewalls that permit ICMP but block other protocols. The file header
-states this intent (`icmp_conn.go:1-6`). It is selected by network string in
-both `Dial` and `Listen` (`dial.go:79-101`, `dial.go:41-55`).
+traverse firewalls that permit ICMP but block other protocols (file header of
+`icmp_conn.go`). It is selected by network string in both `Dial` and `Listen`
+(`dial.go`), and registered as `TransportICMP = "icmp"` alongside tcp/udp in
+`transport.go` (the `// ip:1` comment there is IP protocol number 1 = ICMP).
 
-Two roles share one struct `icmpConn` (`icmp_conn.go:21-30`):
+Two roles share one struct `icmpConn` (`icmp_conn.go`):
 
 - **Client** (`reply == false`): sends Echo **Requests**, reads Echo
-  **Replies** (constructed via `NewICMPClientConn`, `icmp_conn.go:46-56`).
+  **Replies** (constructed via `NewICMPClientConn`).
 - **Server** (`reply == true`): reads Echo **Requests**, sends Echo **Replies**
-  (constructed via `NewICMPServerConn`, `icmp_conn.go:58-65`).
+  (constructed via `NewICMPServerConn`).
 
 The listener side (`icmp_listener.go`) is a connection-oriented adapter over a
-single raw ICMP `net.PacketConn`, **adapted from pion's UDP listener**
-(`icmp_listener.go:1-4`). It demultiplexes many remote peers off one socket and
-synthesizes a per-peer `net.Conn`, which `Accept` then wraps in an
-`icmpConn` server conn (`icmp_listener.go:60-75`).
+single raw ICMP `net.PacketConn`, **adapted from pion's UDP listener** (license
+header at top of file). It demultiplexes many remote peers off one socket and
+synthesizes a per-peer `net.Conn`, which `icmpListener.Accept` then wraps in an
+`icmpConn` server conn.
 
-`TransportICMP = "icmp"` is registered as a known transport alongside tcp/udp
-(`transport.go:9-13`, `transport.go:38-44`, `transport.go:50-58`). The comment
-`// ip:1` (`transport.go:10`) refers to IP protocol number 1 (ICMP).
+### How a caller selects it
+
+- Through the URI pipeline the transport token is `icmp` (CLI help advertises
+  `icmp: ICMP listener or dialer`, `cli/internal/help.go`), e.g. a scheme of
+  `icmp://<addr>` or `icmp+<wrappers>://<addr>`.
+- Through the Go API: `netx.Dial(ctx, "icmp", addr)` /
+  `netx.Listen(ctx, "icmp", addr)`. `"icmp"` is normalized to `"ip:icmp"`; the
+  family-explicit networks `ip4:icmp` and `ip6:ipv6-icmp` are also accepted
+  (the `case` lists in `Dial`/`Listen`, `dial.go`).
+- There is **no driver-registry entry** — icmp is wired only via `transport.go`
+  + the `Dial`/`Listen` switch, so it is part of the core root module's
+  transport set.
 
 ---
 
 ## Public API
 
 ### `NewICMPClientConn(conn net.Conn, version ipV) (net.Conn, error)`
-`icmp_conn.go:46-56`
 
-Wraps an already-dialed raw IP conn (a `*net.IPConn` from `DialIP`/`DialContext`
-on `ip:icmp`) into a client `icmpConn`. Initializes:
-- `reply=false`, `id=1`, `seq=1` (`icmp_conn.go:50-53`).
-- `sentHashes` map sized 256 (`icmp_conn.go:54`).
+Wraps an already-dialed raw IP conn (a `*net.IPConn` from the dialer on
+`ip:icmp`) into a client `icmpConn`. Initializes `reply=false`, `id=1`, `seq=1`,
+and a `sentHashes` map sized 256.
 
-**Contract / caveats:**
-- Never returns a non-nil error in the current code (`icmp_conn.go:55`); the
-  `error` return is forward-compatibility surface only.
-- `id` is initialized to `1` and, for the client, **never changes** — `Write`
-  reads `c.id` without ever updating it (`icmp_conn.go:136-137`). So every
-  client request goes out with identifier `1`. **(See Change hazards: id is
-  effectively a constant on the client.)**
+- Never returns a non-nil error in the current code; the `error` return is
+  forward-compatibility surface only.
+- `id` is initialized to `1` and **never changes** — `Write` reads `c.id`
+  without updating it. So every client request goes out with identifier `1`
+  (see Change hazard 1).
 
 ### `NewICMPServerConn(conn net.Conn, version ipV) (net.Conn, error)`
-`icmp_conn.go:58-65`
 
 Wraps a per-peer conn (the `*icmpListenerConn` produced by the listener) into a
-server `icmpConn`. Sets `reply=true`. Leaves `id`/`seq` at zero value and does
-**not** allocate `sentHashes` (server never calls `rememberSent`). Called only
-from `icmpListener.Accept` (`icmp_listener.go:65`).
+server `icmpConn` with `reply=true`. Leaves `id`/`seq` at zero value and does
+**not** allocate `sentHashes` (the server never calls `rememberSent`). Called
+only from `icmpListener.Accept`.
 
-### `icmpListenConfig` + `Listen(network string, laddr *net.IPAddr)`
-`icmp_listener.go:122-145`, `icmp_listener.go:148-214`
+### `icmpListenConfig` + its `Listen(network string, laddr *net.IPAddr)`
 
-Config struct mirrors pion's UDP `ListenConfig` (field docs copied verbatim,
-`icmp_listener.go:123-145`):
+The config struct mirrors pion's UDP `ListenConfig` (field doc-comments copied
+verbatim from it):
 
 | Field | Meaning | Default / validation |
 |---|---|---|
-| `Backlog` | max pending (unaccepted) conns; **silently discarded when full**, unlike TCP (`icmp_listener.go:124-130`) | `0` → `defaultListenBacklog = 128` (`icmp_listener.go:24`, `icmp_listener.go:149-151`) |
-| `AcceptFilter func([]byte) bool` | decides whether a packet from a *new* peer spawns a conn; nil → accept all (`icmp_listener.go:132-134`, `icmp_listener.go:282-286`) | nil |
-| `ReadBufferSize` | OS receive buffer; applied via `SetReadBuffer`, **error ignored** (`icmp_listener.go:136-138`, `icmp_listener.go:177-179`) | unset if `<= 0` |
-| `WriteBufferSize` | OS send buffer; applied via `SetWriteBuffer`, **error ignored** (`icmp_listener.go:140-142`, `icmp_listener.go:180-182`) | unset if `<= 0` |
-| `Batch pudp.BatchIOConfig` | enables pion batch read/write conn (`icmp_listener.go:144`, `icmp_listener.go:195-198`) | disabled |
+| `Backlog` | max pending (unaccepted) conns; **silently discarded when full**, unlike TCP | `0` → `defaultListenBacklog = 128` (const in `icmp_listener.go`, applied at top of `icmpListenConfig.Listen`) |
+| `AcceptFilter func([]byte) bool` | decides whether a packet from a *new* peer spawns a conn; nil → accept all (consulted in `getConn`) | nil |
+| `ReadBufferSize` | OS receive buffer; applied via `SetReadBuffer`, **error ignored** | unset if `<= 0` |
+| `WriteBufferSize` | OS send buffer; applied via `SetWriteBuffer`, **error ignored** | unset if `<= 0` |
+| `Batch pudp.BatchIOConfig` | enables pion batch read/write conn | disabled |
 
-**Contract / caveats:**
-- `Listen` mutates the receiver: `lc.Backlog = defaultListenBacklog` when zero
-  (`icmp_listener.go:149-151`). The config is built fresh each call in
-  `dial.go:49-55`, so this is not observable to callers today, but it is a
-  side-effect on the passed pointer.
+- `icmpListenConfig.Listen` **mutates its receiver**: it sets
+  `lc.Backlog = defaultListenBacklog` when zero. The config is built fresh on
+  each `netx.Listen` call (in `dial.go`), so this is not observable to callers
+  today, but it is a side-effect on the passed pointer.
 - Batch validation: if `Batch.Enable` and either `WriteBatchSize <= 0` or
-  `WriteBatchInterval <= 0`, returns `ErrInvalidBatchConfig`
-  (`icmp_listener.go:153-155`, `icmp_listener.go:31`).
-- The underlying socket is opened with **`net.ListenIP(network, laddr)`**
-  (`icmp_listener.go:157-160`) — a raw IP socket (see Operational constraints).
+  `WriteBatchInterval <= 0`, returns `ErrInvalidBatchConfig`.
+- The underlying socket is opened with **`net.ListenIP(network, laddr)`** — a
+  raw IP socket (see Operational constraints).
 
-### Options path from `dial.go`
+### Path from `dial.go`
 
-**Listen** (`dial.go:29-59`):
-1. `"icmp"` is normalized to `"ip:icmp"` then falls through
-   (`dial.go:41-43`).
-2. The accepted networks are `ip:icmp`, `ip4:icmp`, `ip6:ipv6-icmp`
-   (`dial.go:44`).
-3. Address resolved via `net.ResolveIPAddr` (`dial.go:45-48`).
-4. An `icmpListenConfig` is built by copying fields **directly from the pion
-   `pudp.ListenConfig`** supplied via `WithPacketListenConfig`
-   (`dial.go:23-27`, `dial.go:49-55`). So all listener tunables (backlog,
-   accept filter, buffer sizes, batch) originate from the same struct that
-   configures the UDP listener — there is no ICMP-specific option type exposed
-   to callers.
-
-**Dial** (`dial.go:73-105`):
-1. Same `"icmp"` → `"ip:icmp"` normalization + fallthrough
-   (`dial.go:79-82`).
-2. Uses the standard `net.Dialer` (`cfg.DialContext`) — `WithDialConfig`
-   wraps a `net.Dialer` (`dial.go:67-71`, `dial.go:83`). There is **no**
-   packet-config path for dial; the dialer just produces a raw `ip:icmp`
-   conn, which is wrapped by `NewICMPClientConn` (`dial.go:101`).
+- **Listen** accepts `icmp` / `ip:icmp` / `ip4:icmp` / `ip6:ipv6-icmp`
+  (`icmp` → `ip:icmp` via fallthrough), resolves with `net.ResolveIPAddr`, then
+  builds an `icmpListenConfig` by copying fields **directly from the pion
+  `pudp.ListenConfig`** supplied via `WithPacketListenConfig`. So all listener
+  tunables (backlog, accept filter, buffer sizes, batch) originate from the same
+  struct that configures the UDP listener — there is no ICMP-specific option
+  type exposed to callers.
+- **Dial** uses the standard `net.Dialer` (`WithDialConfig`) to produce a raw
+  `ip:icmp` conn, which is wrapped by `NewICMPClientConn`. There is **no**
+  packet-config path for dial.
+- v4/v6 detection is shared between both (see "v4 vs v6 detection" below).
 
 ---
 
 ## ICMP framing (echo request/reply mapping)
 
-### Write — encode a payload chunk into one ICMP message
-`icmp_conn.go:119-170`
+### Write — encode a payload chunk into one ICMP message (`icmpConn.Write`)
 
-1. **Type / code selection** (`icmp_conn.go:120-133`):
-   - server (`reply`): `ipv6.ICMPTypeEchoReply` (v6) or `ipv4.ICMPTypeEchoReply`
-     (v4).
+1. **Type / code selection:**
+   - server (`reply`): `ipv6.ICMPTypeEchoReply` (v6) or `ipv4.ICMPTypeEchoReply` (v4).
    - client: `ipv6.ICMPTypeEchoRequest` (v6) or `ipv4.ICMPTypeEcho` (v4).
-   - `Code` is always `0` (`icmp_conn.go:151`).
-2. **Identifier / sequence** (`icmp_conn.go:135-148`):
-   - Client: `id = c.id` (constant `1`); `seq` is `++c.seq` under the write lock,
-     then `rememberSent(seq, b)` records a hash of the payload
-     (`icmp_conn.go:136-142`).
+   - `Code` is always `0`.
+2. **Identifier / sequence:**
+   - Client: `id = c.id` (constant `1`); `seq` is `++c.seq` under the write
+     lock, then `rememberSent(seq, b)` records a hash of the payload.
    - Server: copies the **last-seen** `id`/`seq` it observed on inbound requests
-     under `RLock` (`icmp_conn.go:143-148`). This is how a reply echoes the
-     peer's identifier/sequence so the peer's OS/stack accepts it.
-3. The whole user buffer `b` becomes `icmp.Echo.Data` (`icmp_conn.go:149-157`).
-4. Marshalled via `msg.Marshal(nil)` (`icmp_conn.go:158`) and written to the
-   underlying conn (`icmp_conn.go:162`). On short write returns
-   `io.ErrShortWrite` (`icmp_conn.go:166-168`); on success returns `len(b)`
-   (the user-payload length, **not** the marshalled length) (`icmp_conn.go:169`).
+     under `RLock`. This is how a reply echoes the peer's identifier/sequence so
+     the peer's OS/stack accepts it.
+3. The whole user buffer `b` becomes `icmp.Echo.Data` — **no chunking**.
+4. Marshalled via `msg.Marshal(nil)` (only the ICMP message; the OS prepends the
+   IP header on send) and written to the underlying conn. On short write returns
+   `io.ErrShortWrite`; on success returns `len(b)` (the user-payload length,
+   **not** the marshalled length).
 
-`msg.Marshal(nil)` produces only the ICMP message (type/code/checksum +
-echo header + data); the OS prepends the IP header on send. **(AMBIGUITY:
-checksum handling for the IPv6 case is delegated to `x/net/icmp`/the OS; the
-`nil` pseudo-header argument means no IPv6 pseudo-header checksum is computed in
-user space — verified only at the `Marshal(nil)` call site, `icmp_conn.go:158`.)**
+### Read — extract a payload chunk from one ICMP message (`icmpConn.Read`)
 
-### Read — extract a payload chunk from one ICMP message
-`icmp_conn.go:67-117`
-
-The read loop (`for {}`) reads raw bytes from the underlying conn
-(`icmp_conn.go:68-72`), then parses depending on `ipV` and role:
+The read loop reads raw bytes from the underlying conn, then parses depending on
+`ipV` and role:
 
 | Path | Proto # | Slice parsed | Why |
 |---|---|---|---|
-| v6 server | 58 | `b[:n]` (`icmp_conn.go:74-76`) | server reads via listener buffer with **no IP header** |
-| v6 client | 58 | `b[40:n]` (`icmp_conn.go:77-84`) | raw IPv6 socket read includes a **40-byte IPv6 header** |
-| v4 server | 1 | `b[:n]` (`icmp_conn.go:86-87`) | listener-buffered, no IP header |
-| v4 client | 1 | `b[20:n]` (`icmp_conn.go:88-94`) | raw IPv4 socket read includes a **20-byte IPv4 header** |
+| v6 server | 58 | `b[:n]` | server reads via the listener buffer with **no IP header** |
+| v6 client | 58 | `b[40:n]` | raw IPv6 socket read includes a **40-byte IPv6 header** |
+| v4 server | 1 | `b[:n]` | listener-buffered, no IP header |
+| v4 client | 1 | `b[20:n]` | raw IPv4 socket read includes a **20-byte IPv4 header** |
 
-Protocol numbers: `1` = ICMPv4, `58` = ICMPv6 (`icmp_conn.go:76,83,87,94`).
+(`1` = ICMPv4, `58` = ICMPv6.)
 
-**Header-strip guards (client only):**
-- v6: `len(b) < 40` → `io.ErrShortBuffer`; `n < 40` → `io.ErrUnexpectedEOF`
-  (`icmp_conn.go:78-82`).
-- v4: `len(b) < 20` → `io.ErrShortBuffer`; `n < 20` → `io.ErrUnexpectedEOF`
-  (`icmp_conn.go:89-93`).
-- The fixed 20/40 strip assumes **no IPv4 options** and the standard fixed IPv6
-  header. **(AMBIGUITY / hazard: IPv4 packets with options have headers > 20
-  bytes; this code would then misparse. See Change hazards.)**
+**Header-strip guards (client only):** before stripping, v6 checks `len(b) < 40`
+→ `io.ErrShortBuffer`, `n < 40` → `io.ErrUnexpectedEOF`; v4 uses the same checks
+against 20. The fixed 20/40 strip assumes **no IPv4 options** and the standard
+fixed IPv6 header (see Change hazard 3).
 
-**Body handling** (`icmp_conn.go:100-115`):
-- Only `*icmp.Echo` bodies are accepted; anything else → `io.ErrUnexpectedEOF`
-  (`icmp_conn.go:113-114`). So Echo Reply error bodies, time-exceeded, etc.
-  surface as `io.ErrUnexpectedEOF`.
-- Server: records the inbound `pkt.ID`/`pkt.Seq` into `c.id`/`c.seq` under the
-  write lock (`icmp_conn.go:102-107`) so its next `Write` reply can echo them.
-- Payload copied out: `n = copy(b, pkt.Data)` (`icmp_conn.go:108`). The copy is
-  into `b`, overwriting the raw bytes just read. The number of bytes returned is
-  bounded by `len(b)`; if `pkt.Data` is larger than `b`, **the tail is silently
-  dropped** (no `io.ErrShortBuffer` for the echo payload). **(Change hazard.)**
-- **Client self-echo suppression** (`icmp_conn.go:109-111`): if
-  `!reply && consumeSent(pkt.Seq, b[:n])` matches a hash this client recorded,
-  the packet is skipped (`continue`). This discards the **OS auto-generated
-  Echo Reply** that the kernel produces for the client's own Echo Request when
-  client and server run on the same host / loopback (intent comment at
-  `icmp_conn.go:26`).
+**Body handling:**
+- Only `*icmp.Echo` bodies are accepted; any other body → `io.ErrUnexpectedEOF`
+  (so time-exceeded / error replies surface as `io.ErrUnexpectedEOF`).
+- Server: records inbound `pkt.ID`/`pkt.Seq` into `c.id`/`c.seq` under the write
+  lock so its next `Write` reply can echo them.
+- Payload copied out with `n = copy(b, pkt.Data)`, overwriting the raw bytes
+  just read. If `pkt.Data` is larger than `b`, **the tail is silently dropped**
+  (no `io.ErrShortBuffer` for the echo payload — see Change hazard 4).
+- **Client self-echo suppression:** if `!reply && consumeSent(pkt.Seq, b[:n])`
+  matches a hash this client recorded, the packet is skipped (`continue`). This
+  discards the **OS auto-generated Echo Reply** the kernel produces for the
+  client's own Echo Request when client and server share a host / loopback
+  (intent comment on the `sentHashes` field).
 
 ### Self-echo suppression internals
-`icmp_conn.go:32-44`
 
-- `rememberSent(seq, data)`: `sentHashes[uint8(seq%256)] = sha256(data)`
-  (`icmp_conn.go:32-37`).
-- `consumeSent(seq, data)`: returns `sentHashes[uint8(seq%256)] == sha256(data)`
-  (`icmp_conn.go:39-44`).
+- `rememberSent(seq, data)`: `sentHashes[uint8(seq%256)] = sha256(data)`.
+- `consumeSent(seq, data)`: returns `sentHashes[uint8(seq%256)] == sha256(data)`.
 - The key is `seq % 256` (a `uint8`), so only the **low 8 bits of seq** index a
-  256-slot table; sequence wrap collisions are possible (see Change hazards).
-- `consumeSent` does **not** delete the entry (despite the name "consume"); a
-  matching hash stays and could suppress a later legitimately-identical payload
-  with the same low-8-bit seq. **(Change hazard.)**
+  256-slot table (wrap collisions possible).
+- `consumeSent` does **not** delete the entry (despite the name "consume") and
+  takes the write `Lock` even though it only reads (see Change hazard 2 and
+  Concurrency model).
 
 ---
 
 ## Internal design & invariants
 
-### `ipV` version type
-`ip.go` (full file):
+- **`ip.go`:** `type ipV uint8` with `IPv4 = 4`, `IPv6 = 6` — a 1-byte enum
+  holding the literal IP version number. Branches the framing in `icmpConn` and
+  tags the listener. Note `icmpListenConfig.Listen` stores `version` via the raw
+  literals `4`/`6` in its switch rather than the named `IPv4`/`IPv6` constants
+  (same values, different spelling).
+- **`packet.go`:** `MaxPacketSize = 65535`. It is **not referenced** by any ICMP
+  code in scope; the ICMP read path is instead bounded by `receiveMTU = 8192`
+  (const in `icmp_listener.go`). There is no enforcement that a single `Write`
+  payload fits ICMP MTU (see Change hazard 4).
 
-```go
-package netx
+### v4 vs v6 detection
 
-type ipV uint8
+Identical logic appears in both `Dial` and `icmpListenConfig.Listen`:
 
-const (
-	IPv4 ipV = 4
-	IPv6 ipV = 6
-)
-```
+1. Network explicitly `ip4:icmp` → version 4.
+2. Network explicitly `ip6:ipv6-icmp` → version 6.
+3. Otherwise (the `ip:icmp` default, after the `"icmp"` alias is normalized):
+   inspect `conn.LocalAddr().(*net.IPAddr).IP.To4()`. Non-nil → v4; nil → v6.
 
-A 1-byte enum holding the literal IP version number. Used to branch framing in
-`icmpConn` (`icmp_conn.go:74-95`, `icmp_conn.go:122-131`) and to tag the
-listener (`icmp_listener.go:36`). Note the listener stores `version` as a raw
-literal `4`/`6` in its switch (`icmp_listener.go:164-174`) rather than the named
-`IPv4`/`IPv6` constants — same values, different spelling.
-
-### `packet.go`
-Full file:
-
-```go
-package netx
-
-// MaxPacketSize is the maximum allowed packet size for framed or packet-based protocols.
-const MaxPacketSize = 65535
-```
-
-`MaxPacketSize = 65535` (`packet.go:1-4`). It is **not referenced** by any ICMP
-code in scope (no use in `icmp_conn.go` or `icmp_listener.go`). The ICMP read
-path is instead bounded by `receiveMTU = 8192` (`icmp_listener.go:23`). **(See
-Change hazards: there is no enforcement that a single Write payload fits ICMP
-MTU; `MaxPacketSize` is informational here.)**
-
-### ipV detection logic (v4 vs v6)
-Identical logic appears in both `dial.go:87-100` (dial) and
-`icmp_listener.go:162-175` (listen):
-
-1. If network is explicitly `ip4:icmp` → version 4.
-2. If network is explicitly `ip6:ipv6-icmp` → version 6.
-3. Otherwise (the `ip:icmp` default, after the `"icmp"` alias is normalized to
-   `ip:icmp`): inspect `conn.LocalAddr().(*net.IPAddr).IP.To4()`. Non-nil →
-   v4; nil → v6 (`dial.go:93-99`, `icmp_listener.go:168-174`).
-
-**Invariant / hazard:** the generic `ip:icmp` path relies entirely on
-`To4()` of the **local** address. For a v6 destination resolved under the
-unqualified `ip:icmp`, the local address determines version; mismatches between
-local-address family and the actual peer family will pick the wrong framing.
-The listener additionally ignores the `_` error from the `*net.IPAddr` type
-assertion (`icmp_listener.go:169`) — a non-`*net.IPAddr` `LocalAddr` would nil-
-panic on `iaddr.IP`. **(Change hazard / AMBIGUITY.)**
+The generic `ip:icmp` path therefore picks the version from the **local**
+address family; a mismatch with the actual peer family picks the wrong framing
+(see Change hazard 5). `icmpListenConfig.Listen` also ignores the `_` error from
+the `*net.IPAddr` type assertion, so a non-`*net.IPAddr` `LocalAddr` would
+nil-panic on `iaddr.IP`.
 
 ### Listener accept loop & per-peer demux
-`icmp_listener.go:60-75`, `icmp_listener.go:220-297`
 
-- One `readLoop` goroutine owns the socket (`icmp_listener.go:204`,
-  `icmp_listener.go:220-229`). It chooses `readBatch` if the conn implements
-  `pudp.BatchReader` **and** `readBatchSize > 1`, else single `read`
-  (`icmp_listener.go:224-228`).
-- `read` loops `pConn.ReadFrom` into a `receiveMTU`-sized buffer and dispatches
-  (`icmp_listener.go:251-262`). `readBatch` pre-allocates `readBatchSize`
-  messages each with a `receiveMTU` buffer + 40-byte OOB, then dispatches each
-  (`icmp_listener.go:231-249`).
+- One `readLoop` goroutine owns the socket. It chooses `readBatch` if the conn
+  implements `pudp.BatchReader` **and** `readBatchSize > 1`, else single `read`.
+- `read` loops `pConn.ReadFrom` into a `receiveMTU`-sized buffer and dispatches.
+  `readBatch` pre-allocates `readBatchSize` messages each with a `receiveMTU`
+  buffer + 40-byte OOB, then dispatches each.
 - `dispatchMsg` → `getConn(addr, buf)`; if a conn exists/was created, the raw
-  bytes are appended to that conn's packet buffer:
-  `conn.buffer.Write(buf)` (`icmp_listener.go:264-272`).
+  bytes are appended to that conn's packet buffer via `conn.buffer.Write(buf)`.
 - **Per-peer keying:** conns are keyed by `raddr.String()` in
-  `l.conns map[string]*icmpListenerConn` (`icmp_listener.go:49`,
-  `icmp_listener.go:277`). So peers are distinguished **purely by source IP
-  address string** — *not* by ICMP identifier. (See Change hazards.)
-- **New-peer path** (`icmp_listener.go:278-294`): under `connLock`, if no conn
-  for the addr: check `accepting` (closed → `ErrClosedListener`), run
-  `acceptFilter(buf)` if set (false → drop, no conn), build a conn via
-  `newConn`, then non-blocking `acceptCh <- conn`. On success register in
-  `l.conns`; if the channel is full (backlog exceeded) return
-  `ErrListenQueueExceeded` and the conn is **not** registered (silently
-  dropped, matching the documented backlog behavior).
+  `l.conns map[string]*icmpListenerConn`. Peers are distinguished **purely by
+  source IP address string** — *not* by ICMP identifier (see Change hazard 1).
+- **New-peer path** (in `getConn`): under `connLock`, if no conn for the addr:
+  check `accepting` (closed → `ErrClosedListener`), run `acceptFilter(buf)` if
+  set (false → drop, no conn), build a conn via `newConn`, then non-blocking
+  `acceptCh <- conn`. On success register in `l.conns`; if the channel is full
+  (backlog exceeded) return `ErrListenQueueExceeded` and the conn is **not**
+  registered (silently dropped, matching the documented backlog behavior).
 
-**Critical demux note:** the bytes written into the per-peer buffer at
-`icmp_listener.go:270` are the **raw socket bytes** (an entire ICMP message
-without IP header, since `ListenIP` on a protocol-specific raw socket delivers
-ICMP payload). The server-side `icmpConn.Read` therefore parses with `b[:n]`
-(no header strip) for the server role (`icmp_conn.go:76,87`). This is the
-matching half of the client's header-stripping reads. **(AMBIGUITY: whether
-`net.ListenIP("ip4:icmp", ...)` strips the IP header is OS/stdlib behavior; the
-code's `b[:n]` server parse asserts it does. On Linux raw `ip:` sockets, the
-IPv4 header *is* typically included on read — this is a latent inconsistency,
-see Change hazards.)**
+**Critical demux note:** the bytes written into the per-peer buffer in
+`dispatchMsg` are the **raw socket bytes** (an entire ICMP message without IP
+header, since `ListenIP` on a protocol-specific raw socket delivers ICMP
+payload). The server-side `icmpConn.Read` therefore parses with `b[:n]` (no
+header strip) — the matching half of the client's header-stripping reads.
+Whether `net.ListenIP("ip4:icmp", ...)` strips the IP header is OS/stdlib
+behavior that the `b[:n]` server parse *asserts*; on platforms where `ListenIP`
+includes the IP header the server framing breaks (see Change hazard 3).
 
 ### Per-peer conn (`icmpListenerConn`)
-`icmp_listener.go:299-321`
 
 A thin packet-buffer-backed `net.Conn`:
-- `Read` → `buffer.Read(p)` (pion `packetio.Buffer`, packet-framed)
-  (`icmp_listener.go:324-326`).
-- `Write` → checks write deadline, then `listener.pConn.WriteTo(p, rAddr)`
-  (`icmp_listener.go:329-337`). All peers **share the single listener socket**
-  for writes; `rAddr` selects the destination.
-- `buffer = packetio.NewBuffer()` preserves message boundaries
-  (`icmp_listener.go:317`); each `buffer.Write` of one ICMP message is one
-  `buffer.Read`-able packet.
+- `Read` → `buffer.Read(p)` (pion `packetio.Buffer`, packet-framed).
+- `Write` → checks the write deadline, then `listener.pConn.WriteTo(p, rAddr)`.
+  All peers **share the single listener socket** for writes; `rAddr` selects the
+  destination.
+- `buffer = packetio.NewBuffer()` preserves message boundaries: each
+  `buffer.Write` of one ICMP message is one `buffer.Read`-able packet.
 
 ---
 
 ## Concurrency model
 
 ### `icmpConn` (per-conn)
-- A single `*sync.RWMutex` guards `sentHashes`, `id`, `seq`
-  (`icmp_conn.go:25`). Writers take `Lock`; the server's reply path takes
-  `RLock` to read `id`/`seq` (`icmp_conn.go:144-147`).
-- `Read` and `Write` may run concurrently; the mutex makes the id/seq/hash
-  fields safe, but the underlying `net.Conn` Read/Write are independent (stdlib
-  conns allow concurrent R/W).
-- **Note:** `consumeSent` is named "consume" but takes the **write** `Lock`
-  (`icmp_conn.go:40-42`) even though it only reads — so concurrent Reads
-  serialize on it.
+- A single `*sync.RWMutex` guards `sentHashes`, `id`, `seq`. Writers take `Lock`;
+  the server's reply path takes `RLock` to read `id`/`seq`.
+- `Read` and `Write` may run concurrently; the mutex makes id/seq/hash fields
+  safe, while the underlying `net.Conn` Read/Write are independent (stdlib conns
+  allow concurrent R/W).
+- `consumeSent` takes the **write** `Lock` even though it only reads, so
+  concurrent Reads serialize on it.
 
 ### Listener (shared socket, many peers)
-- `connLock sync.Mutex` guards the `conns` map (`icmp_listener.go:48-49`),
-  taken in `getConn` (`icmp_listener.go:275-276`), `Close`
-  (`icmp_listener.go:85-99`), and `icmpListenerConn.Close`
-  (`icmp_listener.go:345-348`).
-- `accepting atomic.Value` (bool) gates new-conn creation and is read
-  lock-free (`icmp_listener.go:42`, `icmp_listener.go:200`,
-  `icmp_listener.go:279`, `icmp_listener.go:350`).
+- `connLock sync.Mutex` guards the `conns` map — taken in `getConn`,
+  `icmpListener.Close`, and `icmpListenerConn.Close`.
+- `accepting atomic.Value` (bool) gates new-conn creation and is read lock-free.
 - `acceptCh chan *icmpListenerConn` is the bounded accept queue (capacity =
-  `Backlog`) (`icmp_listener.go:43`, `icmp_listener.go:187`); producers are
-  `getConn` (non-blocking send), consumer is `Accept`.
-- `doneCh` / `doneOnce` close the listener once (`icmp_listener.go:44-45`,
-  `icmp_listener.go:81-83`).
+  `Backlog`); producer is `getConn` (non-blocking send), consumer is `Accept`.
+- `doneCh` / `doneOnce` close the listener once.
 - WaitGroups:
-  - `connWG` counts the listener "self" reference (+1 at
-    `icmp_listener.go:201`) plus one per **accepted** conn (`connWG.Add(1)` in
-    `Accept`, `icmp_listener.go:63`); decremented in `Close`
-    (`icmp_listener.go:101`) and `icmpListenerConn.Close`
-    (`icmp_listener.go:343`). When it hits zero, a goroutine closes the socket
-    (`icmp_listener.go:205-211`).
-  - `readWG.Add(2)` waits for `readLoop` and the socket-close goroutine
-    (`icmp_listener.go:202`, `icmp_listener.go:221`, `icmp_listener.go:210`).
-- `errRead` / `errClose` (`atomic.Value`) carry the terminal read error and
-  close error (`icmp_listener.go:53,56`).
+  - `connWG` counts the listener "self" reference (+1 in
+    `icmpListenConfig.Listen`) plus one per **accepted** conn (`connWG.Add(1)` in
+    `Accept`); decremented in `icmpListener.Close` and `icmpListenerConn.Close`.
+    When it hits zero, the goroutine spawned in `Listen` closes the socket.
+  - `readWG.Add(2)` waits for `readLoop` and that socket-close goroutine.
+- `errClose` / `errRead` (`atomic.Value`) carry the terminal close error and
+  read error respectively (fields declared in that order in `icmpListener`).
 
-**Hazard:** `connWG.Add(1)` for an accepted conn happens in `Accept`
-(`icmp_listener.go:63`) but the matching `Done` is in the conn's `Close`
-(`icmp_listener.go:343`). If `Accept` returns a conn that is never `Close`d,
-`connWG` never drains and the socket-closing goroutine never runs. Conversely,
-an unaccepted conn sitting in `acceptCh` at listener `Close` is torn down
-directly (`icmp_listener.go:88-97`) without a `connWG` accounting (it was never
-`Add`ed).
+**Hazard:** `connWG.Add(1)` for an accepted conn happens in `Accept` but the
+matching `Done` is in `icmpListenerConn.Close`. If `Accept` returns a conn that
+is never `Close`d, `connWG` never drains and the socket-closing goroutine never
+runs. Conversely, an unaccepted conn still sitting in `acceptCh` at listener
+`Close` is torn down directly (in `icmpListener.Close`) without `connWG`
+accounting (it was never `Add`ed). See Change hazard 8.
 
 ---
 
 ## Lifecycle & ownership
 
 ### `icmpConn`
-Has **no** `Close` override — it embeds `net.Conn` (`icmp_conn.go:22`), so
-`Close`, `LocalAddr`, `RemoteAddr`, and deadlines delegate to the wrapped conn.
-For a client that is the raw `*net.IPConn`; for a server that is the
-`*icmpListenerConn`.
+Has **no** `Close` override — it embeds `net.Conn`, so `Close`, `LocalAddr`,
+`RemoteAddr`, and deadlines delegate to the wrapped conn. For a client that is
+the raw `*net.IPConn`; for a server that is the `*icmpListenerConn`.
 
 ### Listener `Close`
-`icmp_listener.go:79-115`
-
-- Idempotent via `doneOnce` (`icmp_listener.go:81`).
-- Sets `accepting=false`, closes `doneCh` (`icmp_listener.go:82-83`).
+- Idempotent via `doneOnce`.
+- Sets `accepting=false`, closes `doneCh`.
 - Drains `acceptCh` of unaccepted conns, closing each `doneCh` and removing from
-  `conns` (`icmp_listener.go:87-97`).
-- `connWG.Done()` releases the listener self-reference
-  (`icmp_listener.go:101`).
-- If no remaining conns, waits `readWG` and surfaces `errClose`
-  (`icmp_listener.go:103-111`). If conns remain, returns nil and the socket is
-  closed later when the **last** conn closes.
+  `conns`.
+- `connWG.Done()` releases the listener self-reference.
+- If no remaining conns, waits `readWG` and surfaces `errClose`. If conns remain,
+  returns nil and the socket is closed later when the **last** conn closes.
 
 ### Per-peer conn `Close`
-`icmp_listener.go:340-366`
-
-- Idempotent via `doneOnce` (`icmp_listener.go:342`).
-- `connWG.Done()`, close `doneCh`, delete from `conns` under `connLock`
-  (`icmp_listener.go:343-348`).
-- If this is the last conn **and** the listener is already closed, waits
-  `readWG` and surfaces `errClose` (`icmp_listener.go:350-358`).
+- Idempotent via `doneOnce`.
+- `connWG.Done()`, close `doneCh`, delete from `conns` under `connLock`.
+- If this is the last conn **and** the listener is already closed, waits `readWG`
+  and surfaces `errClose`.
 - Closes the packet buffer; preserves `errClose` precedence over buffer-close
-  error (`icmp_listener.go:360-362`).
+  error.
 
 **Ownership:** the single OS socket (`pConn`) is owned by the listener and is
-closed exactly once, by the goroutine spawned at `Listen`
-(`icmp_listener.go:205-211`) when `connWG` reaches zero. Individual peer conns
-never close the socket; they only `WriteTo` it.
+closed exactly once, by the goroutine spawned in `icmpListenConfig.Listen` when
+`connWG` reaches zero. Individual peer conns never close the socket; they only
+`WriteTo` it.
 
 ---
 
 ## Error, EOF & deadline semantics
 
 ### `icmpConn`
-- Underlying read error → returned as-is with `n=0` (`icmp_conn.go:70-72`).
+- Underlying read error → returned as-is with `n=0`.
 - IP-header-strip failures: `io.ErrShortBuffer` (caller buffer too small) /
-  `io.ErrUnexpectedEOF` (truncated packet) (`icmp_conn.go:78-82`,
-  `icmp_conn.go:89-93`).
-- Parse error from `icmp.ParseMessage` → returned as-is (`icmp_conn.go:97-98`).
-- Non-Echo body → `io.ErrUnexpectedEOF` (`icmp_conn.go:113-114`).
-- There is **no synthetic `io.EOF`** in `icmpConn` — stream end is whatever the
-  underlying conn returns. A peer that simply stops sending ICMP yields a
-  blocking Read (or a deadline error if set).
+  `io.ErrUnexpectedEOF` (truncated packet).
+- Parse error from `icmp.ParseMessage` → returned as-is.
+- Non-Echo body → `io.ErrUnexpectedEOF`.
+- There is **no synthetic `io.EOF`** — stream end is whatever the underlying
+  conn returns. A peer that simply stops sending ICMP yields a blocking Read (or
+  a deadline error if set).
 - Deadlines delegate to the embedded `net.Conn` (no override).
 
 ### Listener / per-peer conn
 - `Accept` returns `ErrClosedListener` on `doneCh`, or the stored read error on
-  `readDoneCh` (`icmp_listener.go:60-74`, `icmp_listener.go:29`).
-- Per-peer `Read` returns whatever `packetio.Buffer.Read` returns: `io.EOF`
-  when the buffer is closed and empty, `io.ErrShortBuffer` if the supplied
-  slice is smaller than the queued packet, and a timeout `net.Error` on read
-  deadline (pion `packetio/buffer.go` Read semantics, referenced from
-  `icmp_listener.go:325`).
+  `readDoneCh`.
+- Per-peer `Read` returns whatever `packetio.Buffer.Read` returns: `io.EOF` when
+  the buffer is closed and empty, `io.ErrShortBuffer` if the supplied slice is
+  smaller than the queued packet, and a timeout `net.Error` on read deadline.
 - Per-peer `Write` returns `context.DeadlineExceeded` if the **write deadline**
-  has already elapsed (`icmp_listener.go:330-333`).
-- `SetDeadline` sets both write deadline and read deadline
-  (`icmp_listener.go:379-383`); `SetReadDeadline` → `buffer.SetReadDeadline`
-  (`icmp_listener.go:386-388`); `SetWriteDeadline` sets only the local
-  `writeDeadline` and intentionally does **not** touch the shared socket's
-  write deadline because the socket is shared across peers
-  (`icmp_listener.go:391-396`). **Consequence:** the write deadline is only
-  enforced as a pre-check; an in-progress `WriteTo` blocking on the OS socket is
-  not interrupted by a peer's write deadline.
+  has already elapsed.
+- `SetDeadline` sets both write and read deadline; `SetReadDeadline` →
+  `buffer.SetReadDeadline`; `SetWriteDeadline` sets only the local
+  `writeDeadline` and intentionally does **not** touch the shared socket's write
+  deadline because the socket is shared across peers. **Consequence:** the write
+  deadline is only a pre-check; an in-progress `WriteTo` blocking on the OS
+  socket is not interrupted by a peer's write deadline.
 
 ---
 
 ## Operational constraints
 
-- **Raw-socket privilege.** `net.ListenIP("ip4:icmp"/...)`
-  (`icmp_listener.go:157`) and `Dial` on `ip:icmp` (`dial.go:83`) open **raw IP
-  sockets**. On Linux this requires `CAP_NET_RAW` (typically root, or the binary
-  granted `cap_net_raw+ep`); without it `ListenIP`/`DialContext` fail and that
-  error is returned verbatim (`icmp_listener.go:158-160`, `dial.go:84-85`).
-  There is **no fallback** to unprivileged datagram ICMP
-  (`ip4:icmp` is used, not the Linux `udp` ping mode), and **no friendly error
-  wrapping** — privilege failures surface as raw stdlib errors.
-- **MTU / payload size.** Receive side is capped at `receiveMTU = 8192`
-  (`icmp_listener.go:23`, `icmp_listener.go:235`, `icmp_listener.go:252`); a
-  single ICMP message larger than 8192 bytes is truncated at read. On the send
-  side, `icmpConn.Write` places the **entire** user buffer in one Echo `Data`
-  field (`icmp_conn.go:155`) with no chunking and no check against MTU or
-  against `MaxPacketSize`. Payloads beyond the path MTU will be IP-fragmented by
-  the OS or rejected. **There is no application-level segmentation here.**
-- **OS auto-reply interaction.** On the client, the kernel may itself answer the
+- **Raw-socket privilege.** `net.ListenIP("ip4:icmp"/...)` and the dialer on
+  `ip:icmp` open **raw IP sockets**. On Linux this requires `CAP_NET_RAW`
+  (typically root, or the binary granted `cap_net_raw+ep`); without it the
+  open fails and that error is returned verbatim. There is **no fallback** to
+  unprivileged datagram ICMP and **no friendly error wrapping** — privilege
+  failures surface as raw stdlib errors (see Change hazard 6).
+- **MTU / payload size.** The receive side is capped at `receiveMTU = 8192`; a
+  single ICMP message larger than that is truncated at read. On the send side,
+  `icmpConn.Write` places the **entire** user buffer in one Echo `Data` field
+  with no chunking and no check against MTU or `MaxPacketSize`. Payloads beyond
+  the path MTU will be IP-fragmented by the OS or rejected. **There is no
+  application-level segmentation here.**
+- **OS auto-reply interaction.** On the client the kernel may itself answer the
   client's Echo Request with an Echo Reply (especially loopback / same-host);
-  the hash-based `consumeSent` filter exists to discard those
-  (`icmp_conn.go:26`, `icmp_conn.go:109-111`).
-- **Batch I/O is Linux-only.** pion's `NewBatchConn` only wires the batch path
-  on `runtime.GOOS == "linux"` (pion `udp/batchconn.go`
-  `NewBatchConn`); on other OSes batch config still constructs but falls back to
-  per-packet read/write. The listener enables batch read only when
-  `readBatchSize > 1` (`icmp_listener.go:224`).
-- **OOB buffer sizing.** `readBatch` allocates 40-byte OOB per message
-  (`icmp_listener.go:236`) — sized for an IPv6 header's worth of control data;
-  this is copied from the UDP origin and not re-tuned for ICMP.
+  the hash-based `consumeSent` filter exists to discard those.
+- **Batch I/O is Linux-only.** pion's `pudp.NewBatchConn` only wires the batch
+  path on `runtime.GOOS == "linux"`; on other OSes batch config still constructs
+  but falls back to per-packet read/write. The listener enables batch read only
+  when `readBatchSize > 1`.
+- **OOB buffer sizing.** `readBatch` allocates a 40-byte OOB per message — sized
+  for an IPv6 header's worth of control data, copied from the UDP origin and not
+  re-tuned for ICMP.
+
+### Testing / exercising it
+
+- **No e2e coverage today.** The `task test:e2e:tun` harness and `cli/internal/e2e/*`
+  contain **no icmp case** (grep `Taskfile.yml` / `cli/internal/e2e/` for
+  `icmp` → none); only `cli/internal/help.go` advertises the transport. Any
+  test that opens an icmp listener/dialer needs `CAP_NET_RAW`
+  (`sudo setcap cap_net_raw+ep <test-binary>`, or run as root) — otherwise the
+  raw-socket open fails before any framing is exercised.
 
 ---
 
 ## Dependencies
 
-**Depends on (internal):**
-- `ipV` type (`ip.go`) — used by `icmpConn` and `icmpListener`.
-- Selected/registered by `dial.go` (`Dial`/`Listen` branches) and
-  `transport.go` (`TransportICMP`). The `cli` references icmp in help text only
-  (`cli/internal/help.go`); no functional coupling found there.
+**Internal:** `ipV` (`ip.go`) used by `icmpConn` and `icmpListener`. Selected /
+registered by `dial.go` (`Dial`/`Listen` branches) and `transport.go`
+(`TransportICMP`). The CLI references icmp in help text only
+(`cli/internal/help.go`); no functional coupling there.
 
-**Depended on by:**
-- Any higher layer that uses `netx.Dial`/`netx.Listen` with network `"icmp"`.
-  As a base transport, it sits **below** the tunnel/mux stack
-  (Mux, TaggedDemux, DemuxClient, PollConn, DNST) documented in the related
-  docs; those layers consume the `net.Conn`/`net.Listener` it returns. The ICMP
-  framing must stay compatible with what those upper layers expect (a reliable,
-  ordered-ish byte pipe is **not** guaranteed by ICMP — see hazards).
+**Depended on by:** any higher layer using `netx.Dial`/`netx.Listen` with
+network `"icmp"`. As a base transport it sits **below** the tunnel/mux stack
+(Mux, TaggedDemux, DemuxClient, PollConn, DNST); those layers consume the
+`net.Conn`/`net.Listener` it returns and assume a byte pipe — which ICMP does
+**not** guarantee to be reliable/ordered. Because `TransportICMP` lives in the
+core root module, changing the framing or version detection is a wire-compat
+change every consumer must tolerate (see Change hazard 7).
 
 **External:**
-- `golang.org/x/net/icmp` — message parse/marshal, `icmp.Echo`
-  (`icmp_conn.go:16`, `icmp_conn.go:73-95`, `icmp_conn.go:149-158`).
+- `golang.org/x/net/icmp` — message parse/marshal, `icmp.Echo`.
 - `golang.org/x/net/ipv4`, `.../ipv6` — ICMP message-type constants and
-  `ipv4.Message` for batch (`icmp_conn.go:17-18`, `icmp_listener.go:19`,
-  `icmp_listener.go:232`).
-- `github.com/pion/transport/v3/udp` (`pudp`) — `BatchIOConfig`,
-  `NewBatchConn`, `BatchReader`, and the `ListenConfig` shape the icmp config is
-  copied from (`icmp_listener.go:18`, `dial.go:7`).
-- `github.com/pion/transport/v3/packetio` — per-peer packet buffer
-  (`icmp_listener.go:17`, `icmp_listener.go:317`).
-- `github.com/pion/transport/v3/deadline` — per-peer write deadline
-  (`icmp_listener.go:16`, `icmp_listener.go:319`).
-- `crypto/sha256` — self-echo suppression hashing (`icmp_conn.go:11`).
-- Versions: `go.mod` pins `pion/transport/v3 v3.1.1` and `golang.org/x/net
-  v0.52.0` (`go.mod:5-6`). **(AMBIGUITY: the pion source quoted for field shapes
-  in this doc was read from a *vendored copy in a sibling project*, not the
-  pinned `v3.1.1` module cache, which was not present in this environment. The
-  field set matched, but minor behavioral differences across patch versions
-  cannot be ruled out.)**
+  `ipv4.Message` for batch.
+- `github.com/pion/transport/v3/udp` (`pudp`) — `BatchIOConfig`, `NewBatchConn`,
+  `BatchReader`, and the `ListenConfig` shape the icmp config is copied from.
+- `github.com/pion/transport/v3/packetio` — per-peer packet buffer.
+- `github.com/pion/transport/v3/deadline` — per-peer write deadline.
+- `crypto/sha256` — self-echo suppression hashing.
+- `go.mod` pins `pion/transport/v3 v3.1.1` and `golang.org/x/net v0.52.0`.
 
 ---
 
 ## Change hazards (MOST IMPORTANT)
 
-1. **Identifier is a constant on the client; peers are demuxed by IP only.**
-   - Client `id` is fixed at `1` and never updated (`icmp_conn.go:52`,
-     `icmp_conn.go:136-137`).
-   - The listener keys conns solely by `raddr.String()` (source IP), **never**
-     by ICMP identifier (`icmp_listener.go:277`, `icmp_listener.go:290`).
-   - Consequence: **two distinct clients behind the same source IP (NAT) cannot
-     be told apart** — they collapse into one peer conn, interleaving their
-     streams. Any future attempt to support multiplexed clients per IP must add
-     identifier-based keying (and the client must vary `id`). Changing the demux
-     key is a wire-compat change.
+Each fact below is stated in full at its API/Read site above; here only the
+"change X → breaks Y" framing is kept.
 
-2. **Sequence-hash self-echo filter is only 8 bits wide and never evicts.**
-   - `sentHashes` is indexed by `seq % 256` (`icmp_conn.go:35`,
-     `icmp_conn.go:43`) and `consumeSent` does not delete matched entries
-     (`icmp_conn.go:39-44`).
-   - Hazards: (a) after 256 writes the table indices wrap and overwrite
-     (acceptable), but (b) a legitimate **server reply** whose payload happens to
-     equal a previously-sent client payload with the same low-8-bit seq will be
-     **silently dropped** as a self-echo (`icmp_conn.go:109-111`). High-rate or
-     repetitive payloads make this collision realistic. Widening the key or
-     making `consume` actually delete are wire-neutral but behavior-changing.
+1. **Client identifier is constant `1`; peers are demuxed by source IP only.**
+   The client `id` is fixed (`NewICMPClientConn`/`icmpConn.Write`) and the
+   listener keys conns solely by `raddr.String()` (`getConn`), never by ICMP
+   identifier. → **Two distinct clients behind one source IP (NAT) collapse into
+   one peer conn and interleave streams.** Supporting per-IP multiplexing means
+   adding identifier-based keying *and* varying the client `id` — a wire-compat
+   change.
 
-3. **Fixed 20/40-byte IP-header strip assumes no IPv4 options and a bare IPv6
-   header.**
-   - Client read strips exactly 20 (v4) / 40 (v6) bytes
-     (`icmp_conn.go:78-94`). IPv4 packets carrying options have headers longer
-     than 20 bytes, which would shift the parse and corrupt framing. Any change
-     to socket type (e.g. switching to a header-included vs header-excluded raw
-     socket) must revisit these constants.
-   - **Server/client asymmetry:** the server parses with **no** strip
-     (`b[:n]`, `icmp_conn.go:76,87`) while the client strips a header. This
-     hard-codes the assumption that `net.ListenIP` delivers ICMP **without** the
-     IP header but `DialIP` reads **with** it. That assumption is OS-dependent;
-     on platforms where `ListenIP` includes the IP header the server framing
-     breaks. (AMBIGUITY flagged above.)
+2. **Self-echo filter is 8 bits wide and never evicts.** `sentHashes` is indexed
+   by `seq % 256` and `consumeSent` never deletes a matched entry. → A
+   legitimate server reply whose payload equals a previously-sent client payload
+   with the same low-8-bit seq is **silently dropped** as a self-echo. Widening
+   the key or making `consume` actually delete is wire-neutral but
+   behavior-changing.
 
-4. **No payload segmentation vs ICMP/IP MTU; receive cap at 8192.**
-   - `Write` emits the whole buffer as one Echo `Data` (`icmp_conn.go:155`); no
-     check against `MaxPacketSize` (`packet.go:4`) or path MTU. `Read` /
-     listener buffers cap at `receiveMTU = 8192` (`icmp_listener.go:23`), and
-     `Read`'s `copy(b, pkt.Data)` silently truncates if the caller's slice is
-     smaller than the echo payload (`icmp_conn.go:108`). Large writes will be
-     IP-fragmented (fragile across firewalls) or truncated on read. Introducing
-     chunking/reassembly is a wire-compat change that upper tunnel layers must
-     tolerate.
+3. **Fixed 20/40-byte IP-header strip + server/client asymmetry.** The client
+   read strips exactly 20 (v4) / 40 (v6) bytes (`icmpConn.Read`), while the
+   server parses with no strip (`b[:n]`). This hard-codes that `DialIP` reads
+   *with* the IP header but `ListenIP` delivers ICMP *without* it — OS-dependent.
+   → IPv4 packets with options (header > 20 bytes), or a platform where
+   `ListenIP` includes the IP header, misparse/corrupt framing. Any change to
+   socket type must revisit these constants on both sides.
 
-5. **v4/v6 detection on the generic `ip:icmp` path depends on local-address
-   `To4()` and ignores the type-assert error.**
-   - `dial.go:93-99` and `icmp_listener.go:168-174` choose version from
-     `LocalAddr().(*net.IPAddr).IP.To4()`. The listener drops the assertion
-     error (`icmp_listener.go:169`) and would nil-panic on a non-`*net.IPAddr`
-     `LocalAddr`. A v4-mapped-v6 local address or a mismatch between local
-     family and peer family selects the wrong ICMP type/proto number, producing
-     packets the peer rejects. Prefer the explicit `ip4:icmp` /
-     `ip6:ipv6-icmp` networks.
+4. **No payload segmentation vs MTU; receive cap 8192; silent read truncation.**
+   `Write` emits the whole buffer as one Echo `Data` with no `MaxPacketSize` /
+   path-MTU check, and `Read`'s `copy(b, pkt.Data)` truncates silently if the
+   caller's slice is smaller. → Large writes get IP-fragmented (fragile across
+   firewalls) or truncated on read. Introducing chunking/reassembly is a
+   wire-compat change upper tunnel layers must tolerate.
 
-6. **Privilege failures are unwrapped; behavior is fail-hard.**
-   - Both `ListenIP` (`icmp_listener.go:157-160`) and `DialContext`
-     (`dial.go:83-85`) surface raw OS errors with no `CAP_NET_RAW`/root hint.
-     Any change to error handling should preserve (or improve) the diagnosability
-     here; callers/tests likely assert on the stdlib error and will not match a
-     wrapped message.
+5. **Generic `ip:icmp` version detection depends on local-address `To4()`.**
+   `Dial` and `icmpListenConfig.Listen` pick the version from
+   `LocalAddr().(*net.IPAddr).IP.To4()`, and the listener drops the type-assert
+   error (would nil-panic on a non-`*net.IPAddr` `LocalAddr`). → A v4-mapped-v6
+   local address or a local/peer family mismatch selects the wrong ICMP
+   type/proto and produces packets the peer rejects. Prefer the explicit
+   `ip4:icmp` / `ip6:ipv6-icmp` networks.
 
-7. **Changing the framing breaks interop with the DNST-style tunnel stack.**
-   - The Echo type/code/id/seq/Data layout (`icmp_conn.go:119-170`) and the
-     "server echoes last-seen id/seq" reply contract (`icmp_conn.go:102-107`,
-     `icmp_conn.go:143-148`) are the wire format. The upper layers
-     (Mux/TaggedDemux/DemuxClient/PollConn/DNST, see related docs) assume a
-     byte-pipe; any change to id/seq semantics, payload placement, or
-     self-echo filtering can desync client/server or corrupt the multiplexed
-     streams above. Treat the framing as a stable wire contract.
+6. **Privilege failures are unwrapped (fail-hard).** Both the `ListenIP` and
+   `DialContext` paths surface raw OS errors with no `CAP_NET_RAW`/root hint.
+   → Callers/tests likely assert on the stdlib error; changing error handling to
+   wrap it will break them. Preserve (or improve without renaming) the
+   diagnosability.
 
-8. **WaitGroup bookkeeping coupling (`connWG`).** An accepted but never-`Close`d
-   server conn pins `connWG` above zero and prevents the socket-closing
-   goroutine from ever running (`icmp_listener.go:63`,
-   `icmp_listener.go:205-211`, `icmp_listener.go:343`). Refactors of accept/close
-   must keep the `Add`/`Done` pairing exact, or the listener will leak the
-   socket on shutdown.
+7. **The framing is the wire contract for the tunnel stack.** The Echo
+   type/code/id/seq/Data layout (`icmpConn.Write`) and the "server echoes
+   last-seen id/seq" reply rule (`icmpConn.Read`/`Write`) are the wire format
+   that Mux/TaggedDemux/DemuxClient/PollConn/DNST ride on. → Any change to
+   id/seq semantics, payload placement, or self-echo filtering can desync
+   client/server or corrupt the multiplexed streams above. Treat as a stable
+   wire contract.
+
+8. **`connWG` bookkeeping coupling.** An accepted-but-never-`Close`d server conn
+   pins `connWG` above zero and prevents the socket-closing goroutine from ever
+   running (`Accept` does the `Add`, `icmpListenerConn.Close` does the `Done`).
+   → Refactors of accept/close must keep the `Add`/`Done` pairing exact, or the
+   listener leaks the socket on shutdown.
 
 ---
 
 ## Related docs
 
-The internals set this is intended to join. **(NOTE: at time of writing only
-`docs/mux-tag-poll.md` exists; the file names below are the intended targets per
-the documentation plan and may not all exist yet.)**
-
-- `pipeline.md` — overall transport→tunnel composition pipeline.
-- `mux.md` — Mux / MuxClient (currently covered in `docs/mux-tag-poll.md`).
-- `poll-tagged.md` — PollConn / TaggedConn / TaggedDemux (currently in
-  `docs/mux-tag-poll.md`).
-- `drivers-proto.md` — `drivers/` and `proto/` (e.g. DNST) layers that ride on
-  top of base transports like this one.
+Index in [README.md](README.md). Companion subsystem docs:
+[pipeline.md](pipeline.md), [mux.md](mux.md), [demux.md](demux.md),
+[poll-tagged.md](poll-tagged.md), [stream-transforms.md](stream-transforms.md),
+[server-tun.md](server-tun.md), [drivers-proto.md](drivers-proto.md),
+[modules-cli.md](modules-cli.md).

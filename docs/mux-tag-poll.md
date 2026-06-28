@@ -1,422 +1,237 @@
-# Multiplexing, Tagging & Polling — Architecture Guide
+# DNS-Tunnel Stack: Mux + DNST + Demux + Poll + Split + Frame
 
-This document describes the **Mux / MuxClient**, **Demux**, **TaggedConn / TaggedDemux**, **DemuxClient**, **PollConn**, and **DNST** modules and how they compose together to build persistent tunneled connections over stateless protocols like DNS.
+This doc covers ONE thing that lives nowhere else: how the stateless-DNS-tunnel layers
+compose, in the **real wire order**, and the cross-layer invariants that make that order
+load-bearing. It deliberately does **not** re-document each type's API — for constructors,
+options, and per-type mechanics see:
 
----
-
-## Table of Contents
-
-- [Overview](#overview)
-- [Mux & MuxClient](#mux--muxclient)
-- [TaggedConn](#taggedconn)
-- [Demux](#demux)
-- [TaggedDemux](#taggeddemux)
-- [DemuxClient](#demuxclient)
-- [PollConn](#pollconn)
-- [DNST (DNS Tunnel)](#dnst-dns-tunnel)
-- [Full Stack: DNS Tunnel Example](#full-stack-dns-tunnel-example)
-- [Data Flow Diagrams](#data-flow-diagrams)
+- `docs/internals/mux.md` — `Mux` / `MuxClient`
+- `docs/internals/demux.md` — `Demux` / `TaggedDemux` / `DemuxClient` / `DemuxDialer`
+- `docs/internals/poll-tagged.md` — `PollConn` / `PollServerConn`, `TaggedConn`
+- `docs/internals/stream-transforms.md` — `SplitConn` / `FrameConn` (and `BufConn`)
+- `docs/internals/drivers-proto.md` — `dnst` encoding
 
 ---
 
-## Overview
+## Why this stack exists
 
-netx provides a set of composable layers that can be stacked to build tunnels over arbitrary transports. The core challenge addressed by these modules is:
+DNS is **stateless and strictly request→response**: a server can only emit bytes as the
+reply to a query it just received, queries carry tiny payloads, and the protocol cannot
+distinguish clients or sessions on its own. To run a persistent, multiplexed, bidirectional
+tunnel over it, netx stacks six wrappers, each fixing one of those limitations:
 
-> How do you create a persistent, multiplexed, bidirectional connection over a protocol that is stateless, request-response oriented, and cannot natively distinguish clients?
-
-The answer is a layered architecture:
-
-| Layer | Purpose | Interface |
-|-------|---------|-----------|| **Mux** | Adapts a `net.Listener` into a single `net.Conn` (server-side) | `net.Conn` |
-| **MuxClient** | Adapts a dial function into a single `net.Conn` (client-side) | `net.Conn` || **DNST** | Encodes data inside DNS queries/responses | `TaggedConn` (server) / `net.Conn` (client) |
-| **TaggedDemux** | Multiplexes sessions over a `TaggedConn`, preserving tags | `net.Listener` |
-| **DemuxClient** | Client-side session framing (prepends/strips session ID) | `net.Conn` |
-| **PollConn** | Converts request-response into persistent bidirectional stream | `net.Conn` |
-
----
-
-## Mux & MuxClient
-
-**Files:** [mux.go](../mux.go), [mux_client.go](../mux_client.go)
-
-When the actual transport is connection-oriented (e.g. TCP), the server receives a `net.Listener` and the client uses a dial function — but the layers above (DNST, Demux, PollConn, etc.) all expect a single `net.Conn`. These two adapters bridge that gap.
-
-### Mux (server-side)
-
-```go
-func NewMux(ln net.Listener) net.Conn
-```
-
-Wraps a `net.Listener` as a `net.Conn`. Reads accept connections from the listener on demand and transition to the next connection transparently when the current one reaches EOF. Writes are sent to the most recently accepted connection.
-
-This is useful when a wrapper (e.g. a DNS tunnel server) expects a single `net.Conn` but the transport is connection-oriented, where each incoming connection carries one or more request-response exchanges.
-
-### MuxClient (client-side)
-
-```go
-type Dialer func() (net.Conn, error)
-
-func NewMuxClient(dial Dialer, opts ...MuxClientOption) net.Conn
-```
-
-Wraps a dial function as a `net.Conn`. A new connection is obtained by calling the dial function on the first Read/Write and whenever the current connection reaches EOF. This provides the illusion of a single persistent connection over a transport that may use short-lived connections.
-
-**Options:**
-
-| Option | Description |
-|--------|-------------|
-| `WithMuxClientLocalAddr` | Address returned by `LocalAddr()` when no connection exists |
-| `WithMuxClientRemoteAddr` | Address returned by `RemoteAddr()` when no connection exists |
-
-### Symmetry
-
-| | Server | Client |
-|--|--------|--------|
-| **Input** | `net.Listener` | `Dialer` |
-| **Output** | `net.Conn` | `net.Conn` |
-| **On EOF** | Accepts next connection | Dials new connection |
-| **Adapter** | `Mux` | `MuxClient` |
-
-Both adapters propagate deadlines to newly established connections and handle close semantics consistently.
+| Wrapper | Fixes |
+|---------|-------|
+| `mux` (server) / `mux` client | adapts the connection-oriented transport to a single (Tagged)Conn |
+| `dnst` | encodes payload into DNS query QNAME (up) / TXT answer (down) |
+| `demux` | carves multiple sessions out of the single conn via an ID prefix |
+| `poll` | turns request→response into a persistent stream (client polls when idle) |
+| `split` | chops writes down to the per-packet `MaxWrite` budget dnst imposes |
+| `frame` | restores message boundaries (2-byte length prefix) over the resulting byte stream |
 
 ---
 
-## TaggedConn
+## Canonical URI (same scheme on both ends)
 
-**File:** [tagged_conn.go](../tagged_conn.go)
+The e2e suite wires the full tunnel with one scheme string, used **identically** on the
+server `--from` and the client `--to`:
 
-`TaggedConn` extends `net.Conn` with tagged read/write operations. A **tag** is an opaque `any` value that carries contextual metadata alongside data — for example, the original DNS query message that must be used to construct the matching response.
-
-```go
-type TaggedConn interface {
-    ReadTagged([]byte, *any) (int, error)   // reads data + populates tag
-    WriteTagged([]byte, any) (int, error)   // writes data using the provided tag
-    Close() error
-    LocalAddr() net.Addr
-    RemoteAddr() net.Addr
-    SetDeadline(t time.Time) error
-    SetReadDeadline(t time.Time) error
-    SetWriteDeadline(t time.Time) error
-}
+```
+udp+mux+dnst{domain=t.com}+demux{id=0000}+poll+split+frame://<addr>
 ```
 
-**Why it exists:** Some protocols require context from the read path to be available on the write path. In DNST, the server must reply to the exact DNS query it received — the `*dns.Msg` is carried as the tag. Without `TaggedConn`, this context would be lost when passing through intermediate layers like a demultiplexer.
+- `id=0000` is two hex bytes → a **2-byte** session ID (not 4).
+- See `Taskfile.yml` (the `SDNST_*`/`CDNST` tunnels) for the live invocation, and run
+  `task test:e2e:tun` to exercise it end-to-end (`task test:e2e:tun lib=true` for the
+  c-shared build).
 
-**TaggedPipe** ([tagged_pipe.go](../tagged_pipe.go)) provides an in-memory `TaggedConn` pair for testing, analogous to `net.Pipe()`.
+The scheme is parsed left→right (`Wrappers.UnmarshalText` in `wrap.go`), so **the leftmost
+wrapper (`mux`) sits closest to the transport and the rightmost (`frame`) closest to the
+application.** The same string resolves to different wrappers per side because the
+`listener bool` is threaded through every driver:
+
+| Wrapper | Server side (starts at `Listener`) | Client side (starts at `Dialer`) |
+|---------|------------------------------------|----------------------------------|
+| `mux`   | `NewMux`: Listener → **TaggedConn** | `NewMuxClient`: Dialer → Conn |
+| `dnst`  | `dnst.NewTaggedServerConn`: TaggedConn → TaggedConn | `dnst.NewClientConn`: Conn → Conn |
+| `demux` | `NewTaggedDemux`: TaggedConn → **Listener** | `NewDemuxClient`: Conn → **Dialer** |
+| `poll`  | `NewPollServerConn` (per accepted conn): Listener → Listener | `NewPollConn`: Dialer → Dialer |
+| `split` | `NewSplitConn`: Listener → Listener | Dialer → Dialer |
+| `frame` | `NewFrameConn`: Listener → Listener | Dialer → Dialer |
+
+The chain only validates if the final type is `Listener` (server) or `Dialer` (client) —
+which is why an invalid ordering fails at parse time, not at connect time.
+
+> Constructor reminders (these have drifted in older docs): `NewMux` returns a
+> **`TaggedConn`** (its tag is the source `net.Conn`, used by `WriteTagged` to reply on the
+> exact connection a request arrived on). The dnst constructors are
+> `dnst.NewServerConn` / `dnst.NewTaggedServerConn` / `dnst.NewClientConn` — there is no
+> `NewDNSTServerConn`.
 
 ---
 
-## Demux
+## Data flow
 
-**File:** [demux.go](../demux.go)
+Both diagrams show **all six layers** in the real order. `App` is the tunneled payload
+(whatever the tun relay carries).
 
-`Demux` is a connection multiplexer that runs over a plain `net.Conn`. It splits a single connection into multiple virtual sessions identified by a fixed-length ID prefix on every packet.
-
-```go
-func NewDemux(c net.Conn, idMask int, opts ...DemuxOption) net.Listener
-```
-
-**Packet format:**
+### Upstream (client → server)
 
 ```
-[ Session ID (idMask bytes) ][ Payload ]
+CLIENT                                              SERVER
+App bytes                                           App bytes (per session)
+  │ Write                                             ▲ Read
+  ▼                                                   │
+frame   ── prepend 2-byte length                  frame   ── reassemble framed messages
+  │                                                   ▲
+  ▼                                                   │
+split   ── chop to MaxWrite budget                split   (no-op on read)
+  │                                                   ▲
+  ▼                                                   │
+poll    ── send on next request cycle             poll(server) ── deliver request payload via Read
+  │                                                   ▲
+  ▼                                                   │
+demux   ── prepend session id (DemuxClient)       demux   ── strip id, route to session (TaggedDemux)
+  │                                                   ▲
+  ▼                                                   │
+dnst    ── base32 → QNAME labels, TXT query       dnst    ── decode QNAME, tag = {dns.Msg, conn tag}
+  │                                                   ▲
+  ▼                                                   │
+mux     ── dial conn on demand (MuxClient)        mux     ── ReadTagged from shared queue, tag = source conn
+  │                                                   ▲
+  ▼                                                   │
+UDP ───────────────── DNS query on the wire ──────────┘
 ```
 
-**Behavior:**
-- A background `readLoop` reads packets from the underlying connection, extracts the session ID, and routes the payload to the corresponding session.
-- New session IDs trigger creation of a virtual `net.Conn` that is delivered via `Accept()`.
-- Each session has its own read queue; packets are dropped (not blocked) if the queue is full.
+### Downstream (server → client)
 
-**Options:**
+The server can only reply to a query it has already received, so every downstream byte
+rides back out as the **answer to the originating request** (carried by the tag).
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `WithDemuxAccQueueSize` | 0 (unbuffered) | Accept queue capacity for new sessions |
-| `WithDemuxSessQueueSize` | 8 | Per-session read queue depth |
-| `WithDemuxBufSize` | 4096 | Read buffer size for the underlying connection |
+```
+SERVER                                              CLIENT
+App bytes (session handler)                         App bytes
+  │ Write                                             ▲ Read
+  ▼                                                   │
+frame   ── prepend 2-byte length                  frame   ── reassemble framed messages
+  │                                                   ▲
+  ▼                                                   │
+split   ── chop to MaxWrite budget                split   (no-op on read)
+  │                                                   ▲
+  ▼                                                   │
+poll(server) ── queue as next response            poll    ── buffer in recv queue
+  │                                                   ▲
+  ▼                                                   │
+demux   ── prepend id, WriteTagged(payload, tag)  demux   ── verify+strip id (DemuxClient)
+  │       (TaggedDemux consumes one tag)             ▲
+  ▼                                                   │
+dnst    ── base32 → TXT answer (255-byte strings) dnst    ── parse TXT answer, base32-decode
+  │       reuses the queried dns.Msg                 ▲
+  ▼                                                   │
+mux     ── WriteTagged routes to the exact         mux     ── Read from current dialed conn (MuxClient)
+  │        source conn (tag = net.Conn)              ▲
+  ▼                                                   │
+UDP ───────────────── DNS answer on the wire ─────────┘
+```
+
+**Idle keep-alive:** when the client app has nothing to send, `PollConn`'s loop fires every
+`interval` (default **1ms**) and writes `nil`. `DemuxClient` still emits the bare session
+ID, `dnst` still forms a valid empty query, and the server replies with any queued data.
+This pending-request-at-all-times is the only way the server can push data downstream.
+(Empty *user* `Write` calls are a no-op — `len(b)==0` returns `(0,nil)`; the nil poll is
+driven solely by the interval timer.)
 
 ---
 
-## TaggedDemux
+## Layer-ordering invariants
 
-**File:** [tagged_demux.go](../tagged_demux.go)
+These are the rules that make the order above non-negotiable. Reordering layers without
+respecting them silently breaks the tunnel.
 
-`TaggedDemux` is the tag-aware variant of `Demux`. It operates over a `TaggedConn` instead of a plain `net.Conn`, preserving the tag through the read→process→write cycle.
+**1. `MaxPacketSize` (65535) bounds every read buffer.** `MaxPacketSize` is defined in
+`packet.go`. Mux, Demux/TaggedDemux, DemuxClient, and both Poll loops all allocate a
+`make([]byte, MaxPacketSize)` read buffer, and demux's `Write` rejects payloads where
+`len(b)+len(id) > MaxPacketSize` (the `"demux: packet too large"` error). It also caps the
+2-byte frame length header's range.
 
-```go
-func NewTaggedDemux(c TaggedConn, idMask int, opts ...DemuxOption) net.Listener
-```
+**2. The `MaxWrite` budget chains downward — `split` MUST sit below something that exposes it.**
+A layer advertises a per-write byte budget via `interface{ MaxWrite() uint16 }`:
 
-**Key difference from Demux:** When a packet is read via `ReadTagged`, the tag (e.g., the DNS query) is stored alongside the data in the session's read queue. When the session writes a response, it consumes a tag from its internal tag queue and passes it to `WriteTagged` on the underlying `TaggedConn`. This ensures each response is correctly associated with its originating request.
+- `dnst` sets the budget: server `MaxWrite` defaults to **765** (`WithMaxWrite` in
+  `dnst_conn.go`); the client computes it from the domain length (`maxQNAMEPayload`).
+- `Demux`/`TaggedDemux` and `DemuxClient` subtract the id length and re-export the
+  remainder (see the `MaxWrite()` probe in `NewDemux`/`NewTaggedDemux`/`NewDemuxClient`);
+  a too-small budget fails construction (`"...MaxWrite is too small for ID"`).
+- `PollConn`/`PollServerConn` forward the budget unchanged (`MaxWrite` in `poll_conn.go`).
+- `SplitConn` *consumes* it: `NewSplitConn` returns an error if the underlying conn lacks
+  `MaxWrite` or reports 0. **This is why `split` is appended right after the
+  budget-bearing layers** — it must wrap a conn that still exposes a non-zero `MaxWrite`,
+  and it chops writes to that size so dnst never has to truncate.
 
-**Internal flow:**
-1. `readLoop` calls `ReadTagged(buf, &tag)` on the underlying `TaggedConn`
-2. Extracts session ID and payload
-3. Routes `{payload, tag}` to the session's `rQueue`
-4. On `session.Read()`, the tag is moved to `tagQueue`
-5. On `session.Write()`, a tag is consumed from `tagQueue` and used in `WriteTagged`
+**3. `frame` is outermost (closest to the app) because it restores boundaries `split` destroyed.**
+`split` chops one logical message into several `MaxWrite`-sized chunks; `frame` (the 2-byte
+big-endian length prefix in `FrameConn`) re-delineates messages on top of that byte stream.
+If `frame` sat below `split`, its length header could itself be split and corrupted. `frame`
+also `Flush`es when the underlying conn implements `BufConn`, coalescing its header+payload
+writes.
 
-This design allows arbitrary layers between the transport and the demux (e.g., encryption) as long as they propagate tags.
+> ⚠️ **Stale source comment:** `frame_conn.go`'s package comment and `NewFrameConn` doc say
+> the length header is **"4-byte"**, but the code uses `[2]byte` / `binary.*Uint16` — it is
+> a **2-byte** (`uint16`) header. Trust the code. (Likewise `buffered_conn.go`'s doc comment
+> still references `WithBufWriterSize`/`WithBufReaderSize`; the real options are
+> `WithBufWrite`/`WithBufRead`.)
 
----
-
-## DemuxClient
-
-**File:** [demux_client.go](../demux_client.go)
-
-`DemuxClient` is the client-side counterpart to `Demux` / `TaggedDemux`. It wraps a `net.Conn` and transparently prepends the session ID on writes and strips it on reads.
-
-```go
-func NewDemuxClient(c net.Conn, id []byte, opts ...DemuxClientOption) Dialer
-```
-
-**Behavior:**
-- `Write(b)` → sends `[id | b]` to the underlying connection
-- `Read(b)` → reads from the underlying connection, validates and strips the ID prefix, returns the payload
-
-This gives the caller a plain `net.Conn` scoped to a single session, while the server-side demux routes packets to the correct virtual connection.
-
-**Options:**
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `WithDemuxClientBufSize` | 4096 | Read/write buffer size |
-
----
-
-## PollConn
-
-**File:** [poll_conn.go](../poll_conn.go)
-
-`PollConn` converts a **request-response** `net.Conn` into a **persistent bidirectional stream**. This is the critical bridge between stateless protocols (where each write must be followed by exactly one read) and the streaming model that applications expect.
-
-```go
-func NewPollConn(conn net.Conn, opts ...PollConnOption) net.Conn
-```
-
-**Problem it solves:** In DNS tunneling, the client can only receive data by sending a request first. If the server has data for the client but the client hasn't sent anything, that data is stuck. PollConn solves this by automatically sending empty poll requests at a configurable interval when idle.
-
-**Internal loop:**
-
-```
-for {
-    select data from sendQueue or wait pollInterval:
-    
-    conn.Write(data)     // send user data or empty poll
-    conn.Read(buf)       // receive server response
-    
-    if response has data:
-        push to recvQueue
-}
-```
-
-**User-facing behavior:**
-- `Write(b)` queues data into the send channel (non-blocking until the queue is full)
-- `Read(b)` pulls from the receive channel, with unread-remainder tracking for partial reads
-- Full deadline support via `SetReadDeadline` / `SetWriteDeadline`
-- `Close()` terminates the poll loop and closes the underlying connection
-
-**Options:**
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `WithPollInterval` | 100ms | How often to poll when idle |
-| `WithPollBufSize` | 4096 | Response read buffer size |
-| `WithPollSendQueueSize` | 32 | Send queue capacity (backpressure) |
-| `WithPollRecvQueueSize` | 32 | Receive queue capacity (backpressure) |
-
-**Important:** The underlying connection must be wrapped so that even zero-length writes produce a valid round-trip. `DemuxClient` achieves this naturally — an empty write still sends the session ID header, which the server's demux processes and responds to.
+**4. A `TaggedDemux` session cannot push before it has received.** `TaggedDemux` carries the
+DNS query (the tag) from read → write so a response reuses its originating query. A session's
+`Write` **blocks on `tagQueue` until a tag is available** (`taggedDemuxSess.Write` in
+`demux_tagged.go`): a tag is only enqueued when the session's `Read` consumes a request.
+So a session cannot emit server-initiated data until the client has first sent (and the
+session has Read) a request — exactly the DNS request/response coupling, surfaced as a hard
+invariant. On the underlying `Mux`, the analogous rule holds: `WriteTagged` requires a
+`net.Conn` tag (from a prior `ReadTagged`) and routes the reply to that exact connection.
 
 ---
 
-## DNST (DNS Tunnel)
+## Operational gotchas (change hazards)
 
-**File:** [proto/dnst/dnst_conn.go](../proto/dnst/dnst_conn.go)
-
-DNST transports arbitrary data inside DNS queries and responses, allowing traffic to be routed through any public DNS resolver.
-
-### Encoding
-
-- **Client → Server (upstream):** Data is Base32-encoded into the QNAME (hostname) of a DNS TXT query. The domain suffix is appended (e.g., `JBSWY3DP.example.com.`).
-- **Server → Client (downstream):** Data is Base32-encoded into the TXT record of the DNS response.
-
-### Server: `NewDNSTServerConn`
-
-```go
-func NewDNSTServerConn(conn net.Conn, domain string, opts ...DNSTServerOption) TaggedConn
-```
-
-Returns a `TaggedConn` where:
-- `ReadTagged` parses a DNS query, decodes the QNAME payload, and stores the `*dns.Msg` as the tag
-- `WriteTagged` constructs a DNS response using the tag (original query) and encodes the payload into a TXT answer
-
-### Client: `NewDNSTClientConn`
-
-```go
-func NewDNSTClientConn(conn net.Conn, domain string, opts ...DNSTClientOption) net.Conn
-```
-
-Returns a plain `net.Conn` where:
-- `Write` encodes data into a DNS TXT query and sends it
-- `Read` parses the DNS response and decodes the TXT record payload
-
-### Limitations
-
-Each DNS query-response pair carries a single message. The connection is inherently stateless — the server cannot distinguish clients or maintain sessions without relying on the payload content. This is why DNST must be composed with the other layers described here.
+- **Drop-on-full, not block.** Demux's read loop drops a *whole new session* if the accept
+  queue is full, and drops a *packet* if a session's read queue is full (both `WarnContext`
+  logged, in `processPacket`). Defaults: accept queue **1** (`WithDemuxAccQueue`),
+  per-session read queue **128** (`WithDemuxReadQueue`). Mux likewise drops nothing but is
+  bounded by its shared read queue (`WithMuxReadQueue`). Under bursty or oversized traffic,
+  tune these before assuming data loss is a bug.
+- **Server idle reclamation.** `WithPollTimeout` (default **0** = off; server-only) makes
+  `PollServerConn`'s loop set a read deadline and, on timeout, close the underlying conn.
+  That close removes the demux session-map entry eagerly, so a reconnecting client with the
+  same session ID gets a fresh session instead of landing in a dead one. Without a timeout a
+  silently-gone client keeps its session alive indefinitely.
+- **Poll interval is client-only; timeout is server-only.** The driver rejects the wrong
+  one per side (`WithPollInterval` for clients, `WithPollTimeout` for servers).
+- **`MuxClient` has no addr overrides.** Its only option is `WithMuxClientLogger`;
+  `LocalAddr`/`RemoteAddr` always return a synthetic `muxVirtualAddr`.
 
 ---
 
-## Full Stack: DNS Tunnel Example
+## Minimal hand-wired example
 
-A complete persistent tunnel over DNS composes the layers as follows:
-
-### Server Side
-
-```
-net.Listener → Mux (net.Conn) → DNSTServerConn (TaggedConn) → TaggedDemux (net.Listener) → Accept() sessions
-```
+You normally build this stack from the URI, but hand-wiring shows the types. Note the dnst
+constructor name and that `NewTaggedDemux` returns `(net.Listener, error)`.
 
 ```go
-// Wrap the TCP/UDP listener into a single net.Conn
-rawConn := netx.NewMux(tcpListener)
+// Server: net.Listener → Mux (TaggedConn) → dnst (TaggedConn) → TaggedDemux (Listener)
+//         → poll(server) → split → frame  (per accepted session)
+muxed := netx.NewMux(udpListener)                              // TaggedConn
+tagged := dnst.NewTaggedServerConn(muxed, "tunnel.example.com") // TaggedConn
+ln, err := netx.NewTaggedDemux(tagged, 2 /* id bytes */, netx.WithDemuxAccQueue(16))
+// then wrap each Accept()ed conn with NewPollServerConn → NewSplitConn → NewFrameConn
 
-// Wrap in DNST (expects a net.Conn)
-serverTagged := dnst.NewDNSTServerConn(rawConn, "tunnel.example.com")
-
-// Demux into sessions (4-byte session ID prefix)
-listener := netx.NewTaggedDemux(serverTagged, 4, netx.WithDemuxAccQueueSize(16))
-
-// Handle sessions
-for {
-    sess, _ := listener.Accept()
-    go handleSession(sess) // sess is a plain net.Conn
-}
-```
-
-### Client Side
-
-```
-MuxClient (net.Conn) → DNSTClientConn (net.Conn) → DemuxClient (net.Conn) → PollConn (net.Conn)
-```
-
-```go
-// Wrap a dial function into a single net.Conn
-transport := netx.NewMuxClient(func() (net.Conn, error) {
+// Client: Dialer → MuxClient (Conn) → dnst (Conn) → DemuxClient (Dialer)
+//         → poll → split → frame
+muxc := netx.NewMuxClient(func() (net.Conn, error) {
     return net.Dial("udp", "8.8.8.8:53")
 })
-
-// Wrap in DNST
-dnstConn := dnst.NewDNSTClientConn(transport, "tunnel.example.com")
-
-// Add session framing
-demuxDial := netx.NewDemuxClient(dnstConn, []byte("SES1"))
-demuxClient, _ := demuxDial()
-
-// Make it persistent with polling
-persistent := netx.NewPollConn(demuxClient, netx.WithPollInterval(50*time.Millisecond))
-
-// Use as a regular net.Conn
-persistent.Write([]byte("hello"))
-persistent.Read(buf)
+dnstc := dnst.NewClientConn(muxc, "tunnel.example.com")        // net.Conn
+dial := netx.NewDemuxClient(dnstc, []byte{0x00, 0x00})         // Dialer
+conn, _ := dial()
+poll := netx.NewPollConn(conn)                                 // wrap; then split → frame
 ```
-
----
-
-## Data Flow Diagrams
-
-### Client Write (upstream)
-
-```
-Application
-    │ Write("hello")
-    ▼
-PollConn ──── queues data, sends on next cycle
-    │ Write("hello")
-    ▼
-DemuxClient ──── prepends session ID
-    │ Write("SES1" + "hello")
-    ▼
-DNSTClientConn ──── Base32-encodes into DNS query QNAME
-    │ DNS Query: KNSXG5BRGEZSA.tunnel.example.com TXT?
-    ▼
-MuxClient ──── dials new connection if needed, forwards write
-    ▼
-Transport (UDP/TCP) ──── sends to resolver / server
-```
-
-### Server Read + Write (downstream)
-
-```
-Transport (UDP/TCP)
-    │ DNS Query arrives
-    ▼
-Mux ──── accepts connection, forwards read
-    ▼
-DNSTServerConn ──── parses query, decodes QNAME, tag = *dns.Msg
-    │ ReadTagged → data="SES1hello", tag=query
-    ▼
-TaggedDemux ──── extracts "SES1", routes payload, stores tag
-    │ session.Read → data="hello", tag queued
-    ▼
-Application (session handler)
-    │ Write("world")
-    ▼
-TaggedDemux session ──── consumes tag, prepends "SES1"
-    │ WriteTagged("SES1world", tag=original query)
-    ▼
-DNSTServerConn ──── constructs DNS response with TXT record
-    │ DNS Response with TXT: Base32("SES1world")
-    ▼
-Mux ──── forwards write to current accepted connection
-    ▼
-Transport (UDP/TCP) ──── sends response back
-```
-
-### Client Read (downstream)
-
-```
-Transport (UDP/TCP)
-    │ DNS Response arrives
-    ▼
-MuxClient ──── forwards read from current dialled connection
-    ▼
-DNSTClientConn ──── parses response, decodes TXT record
-    │ Read → "SES1world"
-    ▼
-DemuxClient ──── validates & strips session ID
-    │ Read → "world"
-    ▼
-PollConn ──── buffers in recvQueue
-    │ Read → "world"
-    ▼
-Application
-```
-
-### Idle Poll Cycle
-
-When the application has nothing to send, PollConn keeps the connection alive:
-
-```
-PollConn (poll interval elapsed, no queued data)
-    │ Write(nil)           ← empty write
-    ▼
-DemuxClient
-    │ Write("SES1")        ← just the session ID, no payload
-    ▼
-DNSTClientConn
-    │ DNS Query: KNSXG5A.tunnel.example.com TXT?
-    ▼
-MuxClient ──── dials if needed, sends through current connection
-    ▼
-   ... round-trip ...
-    ▼
-MuxClient ──── reads response from current connection
-    ▼
-PollConn
-    │ Read → server data (if any) or empty response
-    ▼
-Application (Read returns when data is available)
-```
-
-This polling mechanism is what allows the server to push data to the client at any time — the client always has a pending request that the server can respond to with queued data.
