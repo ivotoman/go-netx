@@ -58,6 +58,27 @@ func tun(cancel context.CancelFunc) *cobra.Command {
 	return cmd
 }
 
+// handshaker is any dialed conn whose security handshake is DEFERRED to the first
+// I/O (pion *dtls.Conn, stdlib *tls.Conn). Driving it eagerly under a bounded,
+// cancellable ctx (see dialPeer) turns a silent first-handshake stall — which
+// pion's 5-tuple conn keying would otherwise make permanent until a full client
+// reconnect ("first connect dark, 2nd attempt works") — into a fast, retryable
+// dial error. AES-GCM/frame/plain conns don't implement this and have no blocking
+// handshake, so the assertion no-ops for them.
+type handshaker interface {
+	HandshakeContext(ctx context.Context) error
+}
+
+const (
+	// 1 initial + 2 retries. Per-attempt 4s comfortably covers a DTLS Certificate
+	// flight on a lossy/censored path; worst case (4+0.25+4+0.25+4 ≈ 12.5s) stays
+	// under the Dart-side netx/wg start timeout so a genuinely dead path returns a
+	// clean transient error to the establishment-retry layer, not a hang.
+	dialHandshakeAttempts = 3
+	dialHandshakeTimeout  = 4 * time.Second
+	dialHandshakeBackoff  = 250 * time.Millisecond
+)
+
 func runTun(ctx context.Context, cancel context.CancelFunc, from, to string, eager bool) error {
 	var fromURI netx.ListenerURI
 	var toURI netx.DialerURI
@@ -76,11 +97,33 @@ func runTun(ctx context.Context, cancel context.CancelFunc, from, to string, eag
 
 	tm := netx.TunMaster[struct{}]{}
 
-	// dialControl is a no-op except on darwin, where it binds netx's outbound
-	// socket to the primary physical interface (IP_BOUND_IF) so the obfuscation
-	// dial does not loop back into the NEPacketTunnelProvider's tunnel (rx=0).
+	// dialControl is a no-op except on iOS, where it binds netx's outbound socket
+	// to the primary physical interface (IP_BOUND_IF) so the obfuscation dial does
+	// not loop back into the NEPacketTunnelProvider's tunnel (rx=0).
+	//
+	// dialPeer also DRIVES the deferred security handshake (DTLS/TLS) eagerly under
+	// a bounded, cancellable context instead of letting pion run it later under an
+	// uncancellable context.Background() at first I/O. pion keys conns by 5-tuple,
+	// so a first handshake that stalls is never re-entered and the relay stays
+	// silently dark until a full reconnect. Driving it here turns a stall into a
+	// fast (retryable) dial error. AES-GCM/frame/plain conns aren't handshakers and
+	// no-op. Both callers — the lazy route handler and the eager pre-warm
+	// (deferredConn) — go through dialPeer, so both get a handshake-proven upstream.
 	dialPeer := func(c context.Context) (net.Conn, error) {
-		return toURI.Dial(c, netx.WithDialConfig(net.Dialer{Control: dialControl}))
+		conn, err := toURI.Dial(c, netx.WithDialConfig(net.Dialer{Control: dialControl}))
+		if err != nil {
+			return nil, err
+		}
+		if hs, ok := conn.(handshaker); ok {
+			hctx, cancelHS := context.WithTimeout(c, dialHandshakeTimeout)
+			err = hs.HandshakeContext(hctx)
+			cancelHS()
+			if err != nil {
+				_ = conn.Close()
+				return nil, err
+			}
+		}
+		return conn, nil
 	}
 
 	// In eager mode, pre-dial the upstream the moment the listener is bound so
@@ -99,21 +142,43 @@ func runTun(ctx context.Context, cancel context.CancelFunc, from, to string, eag
 		if w := warmPeer.Swap(nil); w != nil {
 			peer = w
 		} else {
-			pconn, err := dialPeer(ctx)
-			if err != nil {
-				slog.Error("dial tun", "err", err)
+			// Bounded-retry the dial+handshake (dialPeer drives the deferred
+			// DTLS/TLS handshake). A first handshake that stalls becomes a fast,
+			// retryable error rather than a permanently dark relay. ctx cancel
+			// (NetxInterrupt) aborts between attempts and during the backoff.
+			var pconn net.Conn
+			var lastErr error
+			for attempt := 1; attempt <= dialHandshakeAttempts; attempt++ {
+				if err := ctx.Err(); err != nil {
+					lastErr = err
+					break
+				}
+				c, err := dialPeer(ctx)
+				if err != nil {
+					lastErr = err
+					slog.Warn("dial tun", "attempt", attempt, "err", err)
+				} else {
+					pconn = c
+					break
+				}
+				if attempt < dialHandshakeAttempts {
+					select {
+					case <-ctx.Done():
+					case <-time.After(dialHandshakeBackoff):
+					}
+				}
+			}
+			if pconn == nil {
+				slog.Error("dial tun", "err", lastErr)
 				_ = conn.Close()
 				return false, ctx, netx.Tun{}
 			}
 			peer = pconn
-			// Once-per-connection (the route handler runs per inbound conn, not
-			// per datagram), and only on the lazy path — the eager path logs its
-			// own pre-warm. Gives the lifecycle signal that was missing between
-			// "netx tun started" (listener bound) and "tunnel closed": the
-			// upstream for this session is dialed. For obfs schemes the handshake
-			// is lazy (completes on first I/O), so this is "dialed", not
-			// "handshake proven" — but it pinpoints a session whose upstream never
-			// even dialed vs one stuck waiting on the far side.
+			// Once-per-connection (the route handler runs per inbound conn, not per
+			// datagram), and only on the lazy path — the eager path logs its own
+			// pre-warm. For handshaker schemes (DTLS/TLS) dialPeer has now PROVEN
+			// the upstream handshake; AES-GCM/plain are dialed-only (no blocking
+			// handshake). Pinpoints a session whose upstream never dialed/handshook.
 			slog.Info("netx tun upstream dialed", "to", toURI.Redacted())
 		}
 
