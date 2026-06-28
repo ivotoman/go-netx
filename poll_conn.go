@@ -45,6 +45,9 @@ func init() {
 				if err != nil {
 					return Wrapper{}, fmt.Errorf("poll: invalid interval parameter %q: %w", value, err)
 				}
+				if dur <= 0 {
+					return Wrapper{}, fmt.Errorf("poll: interval must be positive, got %q", value)
+				}
 				opts = append(opts, WithPollInterval(dur))
 			case "timeout":
 				if !listener {
@@ -126,10 +129,13 @@ func WithPollRecvQueue(size uint16) PollConnOption {
 // WithPollInterval sets the polling interval for idle cycles.
 // When no user data is queued, PollConn waits this duration before sending an empty
 // request to check for server-initiated data.
-// Default is 1ms.
+// Default is 1ms. Non-positive durations are ignored (the default is kept), since a
+// zero or negative interval would make the idle poll fire continuously (busy-loop/flood).
 func WithPollInterval(d time.Duration) PollConnOption {
 	return func(c *pollConnCore) {
-		c.interval = d
+		if d > 0 {
+			c.interval = d
+		}
 	}
 }
 

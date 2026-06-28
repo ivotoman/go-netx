@@ -471,3 +471,23 @@ func TestPollServerConn_IdleTimeout(t *testing.T) {
 		t.Errorf("server took too long to detect idle: %v (timeout=%v)", elapsed, timeout)
 	}
 }
+
+// TestPollDriver_RejectsNonPositiveInterval is a regression test for the poll
+// idle-throttle bug: a zero or negative interval makes the idle poll fire
+// continuously, so the driver must reject it at parse time (mirroring dtls
+// flightinterval). A positive interval is still accepted on the client side.
+func TestPollDriver_RejectsNonPositiveInterval(t *testing.T) {
+	drv, err := netx.GetDriver("poll")
+	if err != nil {
+		t.Fatalf("GetDriver(poll): %v", err)
+	}
+	for _, val := range []string{"0s", "-1ms", "-5s"} {
+		if _, err := drv(map[string]string{"interval": val}, false); err == nil {
+			t.Errorf("interval=%q: expected error, got nil", val)
+		}
+	}
+	// A positive interval must still parse (interval is client-side only).
+	if _, err := drv(map[string]string{"interval": "5ms"}, false); err != nil {
+		t.Errorf("interval=5ms: unexpected error: %v", err)
+	}
+}
