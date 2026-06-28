@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -140,5 +141,59 @@ func TestFrameConnDeliversEmptyFrames(t *testing.T) {
 	case <-doneWrite:
 	case <-time.After(2 * time.Second):
 		t.Fatalf("writer blocked")
+	}
+}
+
+// TestFrameConn_OversizeRejected is a regression test for the 16-bit length
+// header: a payload of exactly MaxPacketSize (65535) must round-trip, while a
+// larger payload must be rejected with an error and no partial frame emitted
+// (pre-fix, uint16(len(p)) wrapped silently and desynced the stream).
+func TestFrameConn_OversizeRejected(t *testing.T) {
+	clientRaw, serverRaw := net.Pipe()
+	t.Cleanup(func() { _ = clientRaw.Close(); _ = serverRaw.Close() })
+
+	fcClient := netx.NewFrameConn(clientRaw)
+	fcServer := netx.NewFrameConn(serverRaw)
+
+	// Exactly MaxPacketSize must round-trip losslessly.
+	maxPayload := bytes.Repeat([]byte("a"), 65535)
+	got := make([]byte, len(maxPayload))
+	done := make(chan error, 1)
+	go func() {
+		_, err := io.ReadFull(fcServer, got)
+		done <- err
+	}()
+	time.Sleep(10 * time.Millisecond)
+	n, err := fcClient.Write(maxPayload)
+	if err != nil {
+		t.Fatalf("write 65535: %v", err)
+	}
+	if n != len(maxPayload) {
+		t.Fatalf("write 65535 returned n=%d, want %d", n, len(maxPayload))
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("readfull 65535: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout reading 65535-byte frame")
+	}
+	if !bytes.Equal(got, maxPayload) {
+		t.Fatalf("65535-byte payload corrupted in round-trip")
+	}
+
+	// 65536 must be rejected up front with a "too large" error and n==0, before any
+	// wire write. The short write deadline makes this fail fast (instead of hanging
+	// on the header write) if the guard is ever removed, and asserting the message
+	// keeps the test from passing on an unrelated deadline error.
+	_ = fcClient.SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
+	over := bytes.Repeat([]byte("b"), 65536)
+	n, err = fcClient.Write(over)
+	if err == nil || !strings.Contains(err.Error(), "too large") {
+		t.Fatalf("expected 'too large' error for 65536-byte payload, got n=%d err=%v", n, err)
+	}
+	if n != 0 {
+		t.Fatalf("oversize Write returned n=%d, want 0", n)
 	}
 }

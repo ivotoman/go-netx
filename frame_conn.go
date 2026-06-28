@@ -1,8 +1,9 @@
 /*
 FrameConn is a network layer that adds a length-prefixed framing protocol inside a stream-oriented
 connection (like TCP). This allows wrapping packet-based connections inside stream ones (e.g.
-UDP over TCP+TLS), preserving message boundaries. Each frame consists of a 4-byte big-endian
-length header followed by the payload.
+UDP over TCP+TLS), preserving message boundaries. Each frame consists of a 2-byte big-endian
+(uint16) length header followed by the payload, so a single frame carries at most
+MaxPacketSize (65535) bytes; a larger Write is rejected.
 
 Since FrameConn performs two writes per frame (one for the header and one for the payload),
 it is highly recommended to wrap the underlying connection in a BufferedConn. This coalesces
@@ -13,6 +14,7 @@ package netx
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -49,7 +51,8 @@ type frameConn struct {
 }
 
 // NewFrameConn wraps a net.Conn with a simple length-prefixed framing protocol.
-// Each frame is prefixed with a 4-byte big-endian unsigned integer indicating the length of the frame.
+// Each frame is prefixed with a 2-byte big-endian uint16 length, so the maximum
+// frame payload is MaxPacketSize (65535) bytes; a larger Write returns an error.
 func NewFrameConn(c net.Conn) net.Conn {
 	return &frameConn{
 		Conn: c,
@@ -88,6 +91,14 @@ func (c *frameConn) Read(p []byte) (int, error) {
 
 // Write sends p as a single frame.
 func (c *frameConn) Write(p []byte) (int, error) {
+	// The frame length header is a 2-byte uint16; a payload larger than
+	// MaxPacketSize would wrap len(p) silently and desync the peer stream.
+	// Reject it up front (mirrors the aesgcm/demux oversize errors). No partial
+	// frame is emitted because this returns before any wire write.
+	if len(p) > MaxPacketSize {
+		return 0, errors.New("frame: packet too large")
+	}
+
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
 
