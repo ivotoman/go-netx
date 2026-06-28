@@ -1,12 +1,9 @@
 package dtls
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"crypto/tls"
-	"crypto/x509"
 	"encoding/hex"
-	"encoding/pem"
 	"fmt"
 	"net"
 	"strconv"
@@ -127,7 +124,7 @@ func init() {
 			if cert != nil {
 				var err error
 				cfg.InsecureSkipVerify = true
-				cfg.VerifyPeerCertificate, err = spkiVerifier(cert)
+				cfg.VerifyPeerCertificate, err = netx.SPKIPinVerifier(cert)
 				if err != nil {
 					return netx.Wrapper{}, fmt.Errorf("uri: invalid dtls cert parameter: %w", err)
 				}
@@ -162,28 +159,4 @@ func colonHex(b []byte) string {
 		out = append(out, hexdigits[x>>4], hexdigits[x&0x0f])
 	}
 	return string(out)
-}
-
-func spkiVerifier(certPEM []byte) (func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error, error) {
-	block, _ := pem.Decode(certPEM)
-	if block == nil || block.Type != "CERTIFICATE" {
-		return nil, fmt.Errorf("uri: invalid PEM certificate")
-	}
-	cert, err := x509.ParseCertificate(block.Bytes)
-	if err != nil {
-		return nil, fmt.Errorf("uri: parse x509 certificate: %w", err)
-	}
-	spkiHash := sha256.New().Sum(cert.RawSubjectPublicKeyInfo)
-	return func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-		for _, rawCert := range rawCerts {
-			c, err := x509.ParseCertificate(rawCert)
-			if err != nil {
-				return fmt.Errorf("parse peer cert: %w", err)
-			}
-			if bytes.Equal(sha256.New().Sum(c.RawSubjectPublicKeyInfo), spkiHash) {
-				return nil
-			}
-		}
-		return fmt.Errorf("no matching SPKI found")
-	}, nil
 }
