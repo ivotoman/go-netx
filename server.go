@@ -148,6 +148,22 @@ func (s *Server[ID]) route(ctx context.Context, conn net.Conn) {
 			connCloser = conn
 		}
 		s.mu.Lock()
+		if s.closing.Load() {
+			// Server is closing. Close/Shutdown CAS `closing` before taking s.mu, so
+			// under the lock this read is authoritative: their force-close loop over
+			// s.conns has either already run (and would miss a late insert) or is
+			// blocked on s.mu. Either way, do NOT insert — close this conn ourselves so
+			// it (and any relay goroutine the handler already started) is not leaked.
+			// Everything runs OUTSIDE s.mu, and the closeCooldown token is sent BEFORE
+			// Close(): a closed() callback takes s.mu and reads closeCooldown, so this
+			// ordering stays deadlock-free even if a handler were to invoke closed()
+			// synchronously from Close() (the in-tree TunMaster handler calls it from a
+			// separate relay goroutine).
+			s.mu.Unlock()
+			closeCooldown <- struct{}{} // pre-send so a racing or synchronous closed() won't block
+			_ = connCloser.Close()
+			return
+		}
 		if s.conns == nil {
 			s.conns = make(map[*io.Closer]struct{})
 		}

@@ -393,3 +393,78 @@ func TestShutdownTimeoutForcesClose(t *testing.T) {
 		t.Fatal("serve did not exit after forced Shutdown()")
 	}
 }
+
+// sigCloser signals on Close so a test can detect whether a tracked connection
+// was actually closed (vs. leaked).
+type sigCloser struct {
+	net.Conn
+	once   sync.Once
+	closed chan struct{}
+}
+
+func (s *sigCloser) Close() error {
+	s.once.Do(func() { close(s.closed) })
+	return s.Conn.Close()
+}
+
+// TestServer_RouteAfterCloseClosesConn is a regression test for the post-close
+// conn leak: a route goroutine that finishes matching AFTER Close() has drained
+// s.conns must close the connection itself instead of inserting it into the
+// already-drained map and leaking it (along with any relay goroutine the handler
+// started). The ordering here is deterministic: Close() fully completes while the
+// handler is parked, then the route goroutine is released into its insert branch.
+func TestServer_RouteAfterCloseClosesConn(t *testing.T) {
+	var s netx.Server[string]
+	s.Logger = &memLogger{}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	closerClosed := make(chan struct{})
+
+	s.SetRoute("x", func(_ context.Context, conn net.Conn, _ func()) (bool, io.Closer) {
+		close(entered)
+		<-release // park inside the handler, before route's insert into s.conns
+		return true, &sigCloser{Conn: conn, closed: closerClosed}
+	})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	go func() { _ = s.Serve(context.Background(), ln) }()
+
+	c, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler never entered")
+	}
+
+	// Fully close the server while the route goroutine is parked. Close runs its
+	// force-close loop over s.conns (empty — nothing inserted yet) and returns;
+	// route goroutines are not tracked by listenerGroup, so this must not block.
+	closeDone := make(chan struct{})
+	go func() { _ = s.Close(); close(closeDone) }()
+	select {
+	case <-closeDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not complete while a route goroutine was in flight")
+	}
+
+	// Release the route goroutine into its insert branch, now that Close has finished.
+	close(release)
+
+	select {
+	case <-closerClosed:
+		// Fixed behavior: route saw s.closing and closed the conn instead of leaking it.
+	case <-time.After(2 * time.Second):
+		t.Fatal("conn leaked: route inserted after Close drained s.conns; connCloser never closed")
+	}
+}
