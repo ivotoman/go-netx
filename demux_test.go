@@ -67,9 +67,9 @@ func TestDemux_Basic(t *testing.T) {
 	// Write response from server back to client
 	response := []byte("World")
 	go func() {
-		_, err = sess.Write(response)
-		if err != nil {
-			t.Errorf("session write error: %v", err)
+		// Use a local error to avoid racing the outer err/n with the read below.
+		if _, werr := sess.Write(response); werr != nil {
+			t.Errorf("session write error: %v", werr)
 		}
 	}()
 
@@ -340,5 +340,126 @@ func TestDemuxSess_Deadline(t *testing.T) {
 
 	if elapsed < 10*time.Millisecond {
 		t.Errorf("Returned too early: %v", elapsed)
+	}
+}
+
+// TestDemux_SessionCloseAfterListenerClose is a regression test for the
+// double-close panic: closing a session after the parent demux already closed
+// every session's rQueue must not panic ("close of closed channel").
+func TestDemux_SessionCloseAfterListenerClose(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+
+	l, err := netx.NewDemux(serverConn, 4, netx.WithDemuxAccQueue(4))
+	if err != nil {
+		t.Fatalf("NewDemux: %v", err)
+	}
+
+	go func() {
+		mc, _ := netx.NewDemuxClient(clientConn, []byte("1234"))()
+		_, _ = mc.Write([]byte("hi"))
+	}()
+
+	sess, err := l.Accept()
+	if err != nil {
+		t.Fatalf("Accept: %v", err)
+	}
+
+	if err := l.Close(); err != nil {
+		t.Fatalf("listener Close: %v", err)
+	}
+	// Must not panic, and must be idempotent.
+	if err := sess.Close(); err != nil {
+		t.Errorf("session Close after listener Close: %v", err)
+	}
+	if err := sess.Close(); err != nil {
+		t.Errorf("second session Close: %v", err)
+	}
+}
+
+// TestDemux_ConcurrentCloseNoPanic stresses demux.Close racing demuxSess.Close;
+// pre-fix this reliably panics on a double close of rQueue.
+func TestDemux_ConcurrentCloseNoPanic(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		clientConn, serverConn := net.Pipe()
+		l, err := netx.NewDemux(serverConn, 4, netx.WithDemuxAccQueue(4))
+		if err != nil {
+			clientConn.Close()
+			t.Fatalf("NewDemux: %v", err)
+		}
+		go func() {
+			mc, _ := netx.NewDemuxClient(clientConn, []byte("1234"))()
+			_, _ = mc.Write([]byte("hi"))
+		}()
+		sess, err := l.Accept()
+		if err != nil {
+			_ = l.Close()
+			clientConn.Close()
+			continue
+		}
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); _ = l.Close() }()
+		go func() { defer wg.Done(); _ = sess.Close() }()
+		wg.Wait()
+		clientConn.Close()
+	}
+}
+
+// TestDemuxSess_WriteDoesNotCorruptQueuedPayload is a regression test for the
+// buffer-aliasing bug: s.id is a low-bound slice of the read buffer that still
+// backs the first packet's queued payload, so append(s.id, b...) used to
+// overwrite that queued payload in place. A session Write must leave queued
+// inbound data intact.
+func TestDemuxSess_WriteDoesNotCorruptQueuedPayload(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+
+	l, err := netx.NewDemux(serverConn, 4, netx.WithDemuxAccQueue(4), netx.WithDemuxReadQueue(4))
+	if err != nil {
+		t.Fatalf("NewDemux: %v", err)
+	}
+	defer l.Close()
+
+	// Drain server->client traffic so the session Write below does not block.
+	go func() {
+		buf := make([]byte, 1024)
+		for {
+			if _, err := clientConn.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+
+	const original = "ORIGINALPAYLOAD" // 15 bytes
+	go func() {
+		mc, _ := netx.NewDemuxClient(clientConn, []byte("1234"))()
+		_, _ = mc.Write([]byte(original))
+	}()
+
+	sess, err := l.Accept()
+	if err != nil {
+		t.Fatalf("Accept: %v", err)
+	}
+	defer sess.Close()
+
+	// Same length as the queued payload: append would reuse s.id's spare capacity
+	// and overwrite the queued bytes in place on the buggy code path.
+	overwrite := bytes.Repeat([]byte("X"), len(original))
+	wn, err := sess.Write(overwrite)
+	if err != nil {
+		t.Fatalf("session Write: %v", err)
+	}
+	if wn != len(overwrite) {
+		t.Errorf("session Write returned n=%d, want %d", wn, len(overwrite))
+	}
+
+	buf := make([]byte, 64)
+	n, err := sess.Read(buf)
+	if err != nil {
+		t.Fatalf("session Read: %v", err)
+	}
+	if string(buf[:n]) != original {
+		t.Errorf("queued payload corrupted by Write: got %q, want %q", buf[:n], original)
 	}
 }

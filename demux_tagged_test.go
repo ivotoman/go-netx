@@ -234,3 +234,69 @@ func TestTaggedDemux_Close(t *testing.T) {
 		t.Error("Expected error accepting on closed listener")
 	}
 }
+
+// TestTaggedDemuxSess_ConcurrentWriteNoRace exercises the buffer-aliasing fix on
+// the tagged session Write path: concurrent Writes must not race on s.id's
+// backing array (pre-fix, append(s.id, b...) reused it). Meaningful under -race.
+func TestTaggedDemuxSess_ConcurrentWriteNoRace(t *testing.T) {
+	clientConn, serverConn := netx.TaggedPipe()
+	defer clientConn.Close()
+
+	l, err := netx.NewTaggedDemux(serverConn, 4, netx.WithDemuxAccQueue(4), netx.WithDemuxReadQueue(16))
+	if err != nil {
+		t.Fatalf("NewTaggedDemux: %v", err)
+	}
+	defer l.Close()
+
+	const n = 8
+
+	// Drain server->client responses so the session Writes below do not block.
+	go func() {
+		buf := make([]byte, 1024)
+		var tag any
+		for {
+			if _, err := clientConn.ReadTagged(buf, &tag); err != nil {
+				return
+			}
+		}
+	}()
+
+	// Send n packets for one session. The FIRST packet sizes s.id's backing
+	// array: a long (64-byte) payload leaves large spare capacity after the
+	// 4-byte id, and the tiny 2-byte Write payload below fits in it — so the
+	// pre-fix append(s.id, b...) reuses that shared array and the concurrent
+	// Writes collide on it, producing a data race under -race. (A deterministic
+	// queued-payload corruption test like the non-tagged one is not possible
+	// here: a tagged Write needs a tag from a prior Read, which already consumed
+	// the only payload that aliases s.id's buffer.)
+	go func() {
+		for i := 0; i < n; i++ {
+			pkt := append([]byte("1001"), bytes.Repeat([]byte("p"), 64)...)
+			_, _ = clientConn.WriteTagged(pkt, i)
+		}
+	}()
+
+	conn, err := l.Accept()
+	if err != nil {
+		t.Fatalf("Accept: %v", err)
+	}
+
+	// Read n packets so the session's tagQueue holds n tags for the Writes.
+	buf := make([]byte, 1024)
+	for i := 0; i < n; i++ {
+		if _, err := conn.Read(buf); err != nil {
+			t.Fatalf("Read %d: %v", i, err)
+		}
+	}
+
+	// Fire n concurrent Writes; each consumes one queued tag and builds a frame.
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _ = conn.Write([]byte("response-payload"))
+		}()
+	}
+	wg.Wait()
+}

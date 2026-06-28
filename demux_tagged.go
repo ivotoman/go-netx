@@ -260,8 +260,13 @@ func (s *taggedDemuxSess) Write(b []byte) (n int, err error) {
 		return 0, errors.New("demux: packet too large")
 	}
 
-	// Re-construct payload with ID
-	payload := append(s.id, b...)
+	// Use a fresh buffer to avoid mutating s.id's backing array. s.id is a
+	// low-bound slice of the read buffer that still backs the first packet's
+	// queued payload, so append(s.id, b...) would reuse that spare capacity and
+	// corrupt queued data (and race concurrent Writes). Mirrors demuxClient.Write.
+	payload := make([]byte, len(s.id)+len(b))
+	copy(payload, s.id)
+	copy(payload[len(s.id):], b)
 
 	n, err = s.demux.bc.WriteTagged(payload, tag)
 	if err != nil {
